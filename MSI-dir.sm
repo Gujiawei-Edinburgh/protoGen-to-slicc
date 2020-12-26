@@ -1,0 +1,883 @@
+machine(MachineType:Directory, "Directory protocol")
+    :
+      DirectoryMemory * directory;
+      Cycles toMemLatency := 1;
+    
+    MessageBuffer *forwardToCache, network="To", virtual_network="1", vnet_type="forward";
+    MessageBuffer *responseToCache, network="To", virtual_network="2", vnet_type="response";
+    MessageBuffer *responseFromCache, network="From", virtual_network="2", vnet_type="response";
+    MessageBuffer *requestFromCache, network="From", virtual_network="0", vnet_type="request";
+    
+
+{
+    state_declaration(State, desc="Directory states", default="Directory_State_I") {
+        I, AccessPermission:Read_Write,  desc="Invalid in the caches.";
+        S, AccessPermission:Read_Only,   desc="At least one cache has the blk";
+        M, AccessPermission:Invalid,     desc="A cache has the block in M";
+        S_D, AccessPermission:Read_Write,      desc="...TODO...";
+    }
+
+    
+    structure(Entry, desc="...", interface="AbstractCacheEntry", main="false") {
+        State DirState,         desc="Directory state";
+        NetDest Sharers,        desc="Sharers for this block";
+        NetDest Owner,          desc="Owner of this block";
+        DataBlock cl,           desc="data block";
+    }
+
+    Tick clockEdge();
+    MachineID mapAddressToMachine(Addr addr, MachineType mtype);
+
+    Entry getDirectoryEntry(Addr addr), return_by_pointer = "yes" {
+        Entry dir_entry := static_cast(Entry, "pointer", directory.lookup(addr));
+        if (is_invalid(dir_entry)) {
+            dir_entry := static_cast(Entry, "pointer", directory.allocate(addr, new Entry));
+        }
+        return dir_entry;
+    }
+
+    State getState(Addr addr) {
+        if (directory.isPresent(addr)) {
+            return getDirectoryEntry(addr).DirState;
+        } else {
+            return State:I;
+        }
+    }
+
+    void setState(Addr addr, State state) {
+        if (directory.isPresent(addr)) {
+            if (state == State:M) {
+                DPRINTF(RubySlicc, "Owner %s\n", getDirectoryEntry(addr).Owner);
+                assert(getDirectoryEntry(addr).Owner.count() == 1);
+                assert(getDirectoryEntry(addr).Sharers.count() == 0);
+            }
+	    
+            getDirectoryEntry(addr).DirState := state;
+            if (state == State:I)  {
+                assert(getDirectoryEntry(addr).Owner.count() == 0);
+                assert(getDirectoryEntry(addr).Sharers.count() == 0);
+            }
+        }
+    }
+
+    AccessPermission getAccessPermission(Addr addr) {
+        if (directory.isPresent(addr)) {
+            Entry e := getDirectoryEntry(addr);
+            return Directory_State_to_permission(e.DirState);
+        } else  {
+            return AccessPermission:NotPresent;
+        }
+    }
+    void setAccessPermission(Addr addr, State state) {
+        if (directory.isPresent(addr)) {
+            Entry e := getDirectoryEntry(addr);
+            e.changePermission(Directory_State_to_permission(state));
+        }
+    }
+
+    void functionalRead(Addr addr, Packet *pkt) {
+        functionalMemoryRead(pkt);
+    }
+
+    int functionalWrite(Addr addr, Packet *pkt) {
+        if (functionalMemoryWrite(pkt)) {
+            return 1;
+        } else {
+            return 0;
+        }
+    }
+
+
+
+    out_port(fwdToCache_out, CoherenceMessage, forwardToCache);
+    out_port(respToCache_out, CoherenceMessage, responseToCache);
+
+    
+
+    in_port(respFromCache_in, CoherenceMessage, respFromCache) {
+        if (respFromCache_in.isReady(clockEdge())) {
+            peek(respFromCache_in, CoherenceMessage) {
+                Entry entry := getDirectoryEntry(in_msg.LineAddress);
+                State st := getState(in_msg.LineAddress);
+                Addr LineAddress := in_msg.LineAddress;
+                if (st == State:I) {
+                    if (in_msg.Type == CoherenceMessageType:GetM) {
+                        enqueue(respToCache_out, CoherenceMessage, 1) {
+                            out_msg.LineAddress := LineAddress;
+                            out_msg.Type := CoherenceMessageType:GetM_Ack_AD;
+                            out_msg.Sender := machineID;
+                            out_msg.Destination.add(in_msg.Sender);
+                            out_msg.cl := entry.cl;
+                            out_msg.acksExpected := entry.Sharers.count();
+                            out_msg.MessageSize := MessageSizeType:Control;
+                        } 
+                        entry.Owner.clear();
+                        entry.Owner.add(in_msg.Sender);
+						entry.Sharers.clear(); 
+						setState(LineAddress, State:M);                
+                        respFromCache_in.dequeue(clockEdge());
+                    }else if (in_msg.Type == CoherenceMessageType:GetS){
+                        entry.Sharers.add(in_msg.Sender);
+                        enqueue(respToCache_out, CoherenceMessage, 1) {
+                            out_msg.LineAddress := LineAddress;
+                            out_msg.Type := CoherenceMessageType:Data;
+                            out_msg.Sender := machineID;
+                            out_msg.Destination.add(in_msg.Sender);
+                            out_msg.cl := entry.cl;
+                            //out_msg.acksExpected := 0;
+                            out_msg.MessageSize := MessageSizeType:Control;
+                        }
+                        setState(LineAddress, State:S);
+                        respFromCache_in.dequeue(clockEdge());
+                    }else if (in_msg.Type == CoherenceMessageType:PutM){
+                        enqueue(fwdToCache_out, CoherenceMessage, 1) {
+                            out_msg.LineAddress := LineAddress;
+                            out_msg.Type := CoherenceMessageType:Put_Ack;
+                            out_msg.Sender := machineID;
+                            out_msg.Destination.add(in_msg.Sender);
+                            //out_msg.cl := entry.cl;
+                            //out_msg.acksExpected := 0;
+                            out_msg.MessageSize := MessageSizeType:Control;
+                        }
+                        entry.Sharers.remove(in_msg.Sender);
+                        if (entry.Owner.isElement(in_msg.Sender)){
+                            entry.cl := in_msg.cl;
+							entry.Owner.clear();
+							entry.Sharers.clear();
+                            DPRINTF(RubySlicc, "Switch %#x %s: %s -> I\n", LineAddress, st, in_msg.Type);
+                            setState(LineAddress, State:I);
+                        }else{
+							entry.Owner.clear();
+							entry.Sharers.clear();
+                            DPRINTF(RubySlicc, "Switch %#x %s: %s -> I\n", LineAddress, st, in_msg.Type);
+                            setState(LineAddress, State:I);
+                        }
+                        respFromCache_in.dequeue(clockEdge());
+                    }else if (in_msg.Type == CoherenceMessageType:PutS){
+                        enqueue(fwdToCache_out, CoherenceMessage, 1) {
+                            out_msg.LineAddress := LineAddress;
+                            out_msg.Type := CoherenceMessageType:Put_Ack;
+                            out_msg.Sender := machineID;
+                            out_msg.Destination.add(in_msg.Sender);
+                            out_msg.cl := entry.cl;
+                            //out_msg.acksExpected := 0;
+                            out_msg.MessageSize := MessageSizeType:Control;
+                        }
+                        entry.Sharers.remove(in_msg.Sender);
+                        if (entry.Sharers.count() == 0){
+                    		entry.Owner.clear();
+							entry.Sharers.clear();
+                            DPRINTF(RubySlicc, "Switch %#x %s: %s -> I\n", LineAddress, st, in_msg.Type);
+                            setState(LineAddress, State:I);
+                        }else{
+							entry.Owner.clear();
+							entry.Sharers.clear();
+                            DPRINTF(RubySlicc, "Switch %#x %s: %s -> I\n", LineAddress, st, in_msg.Type);
+                            setState(LineAddress, State:I);
+                        }
+                        respFromCache_in.dequeue(clockEdge());
+                    }else if (in_msg.Type == CoherenceMessageType:Upgrade){
+                        enqueue(respToCache_out, CoherenceMessage, 1) {
+                            out_msg.LineAddress := LineAddress;
+                            out_msg.Type := CoherenceMessageType:GetM_Ack_AD;
+                            out_msg.Sender := machineID;
+                            out_msg.Destination.add(in_msg.Sender);
+                            out_msg.cl := entry.cl;
+                            out_msg.acksExpected := entry.Sharers.count();
+                            out_msg.MessageSize := MessageSizeType:Control;
+                        }
+						entry.Owner.clear();
+                        entry.Owner.add(in_msg.Sender);
+						entry.Sharers.clear(); 
+                        DPRINTF(RubySlicc, "Switch %#x %s: %s -> M\n", LineAddress, st, in_msg.Type);
+                        setState(LineAddress, State:M);
+                        respFromCache_in.dequeue(clockEdge());
+                    }else{
+                        // stall
+                    }
+                }else if (st == State:M){
+                    if (in_msg.Type == CoherenceMessageType:GetM){
+                        enqueue(fwdToCache_out, CoherenceMessage, 1) {
+                            out_msg.LineAddress := LineAddress;
+                            out_msg.Type := CoherenceMessageType:Fwd_GetM;
+                            out_msg.Sender := in_msg.Sender;
+                            out_msg.Destination.addNetDest(entry.Owner);
+                            //out_msg.cl := entry.cl;
+                            //out_msg.acksExpected := 0;
+                            out_msg.MessageSize := MessageSizeType:Control;
+                        }
+                        entry.Owner.clear();
+                        entry.Owner.add(in_msg.Sender);
+						entry.Sharers.clear(); 
+                        DPRINTF(RubySlicc, "Switch %#x %s: %s -> M\n", LineAddress, st, in_msg.Type);
+                        setState(LineAddress, State:M);
+                        respFromCache_in.dequeue(clockEdge());
+                    }else if(in_msg.Type == CoherenceMessageType:GetS){
+                        enqueue(fwdToCache_out, CoherenceMessage, 1) {
+                            out_msg.LineAddress := LineAddress;
+                            out_msg.Type := CoherenceMessageType:Fwd_GetS;
+                            out_msg.Sender := in_msg.Sender;
+                            out_msg.Destination.addNetDest(entry.Owner);
+                            //out_msg.cl := entry.cl;
+                            //out_msg.acksExpected := 0;
+                            out_msg.MessageSize := MessageSizeType:Control;
+                        }
+                        entry.Sharers.add(in_msg.Sender);
+                        entry.Sharers.addNetDest(entry.Owner);
+                        DPRINTF(RubySlicc, "Switch %#x %s: %s -> M_GetS\n", LineAddress, st, in_msg.Type);
+                        setState(LineAddress, State:M_GetS);
+                        respFromCache_in.dequeue(clockEdge());
+                    }else if(in_msg.Type == CoherenceMessageType:PutM){
+                        enqueue(fwdToCache_out, CoherenceMessage, 1) {
+                            out_msg.LineAddress := LineAddress;
+                            out_msg.Type := CoherenceMessageType:Put_Ack;
+                            out_msg.Sender := machineID;
+                            out_msg.Destination.add(in_msg.Sender);
+                            //out_msg.cl := entry.cl;
+                            //out_msg.acksExpected := 0;
+                            out_msg.MessageSize := MessageSizeType:Control;
+                        }
+                        entry.Sharers.remove(in_msg.Sender);
+                        if (entry.Owner.isElement(in_msg.Sender)){
+                            entry.cl := in_msg.cl;
+							entry.Owner.clear();
+							entry.Sharers.clear();
+                            DPRINTF(RubySlicc, "Switch %#x %s: %s -> I\n", LineAddress, st, in_msg.Type);
+                            setState(LineAddress, State:I);
+                        }else{
+							entry.Sharers.clear(); 
+                            DPRINTF(RubySlicc, "Switch %#x %s: %s -> M\n", LineAddress, st, in_msg.Type);
+                            setState(LineAddress, State:M);
+                        }
+                        respFromCache_in.dequeue(clockEdge());
+                    }else if(in_msg.Type == CoherenceMessageType:PutS){
+                        enqueue(fwdToCache_out, CoherenceMessage, 1) {
+                            out_msg.LineAddress := LineAddress;
+                            out_msg.Type := CoherenceMessageType:Put_Ack;
+                            out_msg.Sender := machineID;
+                            out_msg.Destination.add(in_msg.Sender);
+                            out_msg.cl := entry.cl;
+                            //out_msg.acksExpected := 0;
+                            out_msg.MessageSize := MessageSizeType:Control;
+                        }
+                        entry.Sharers.remove(in_msg.Sender);
+                        if (entry.Sharers.count() == 0){
+							entry.Sharers.clear(); 
+                            DPRINTF(RubySlicc, "Switch %#x %s: %s -> M\n", LineAddress, st, in_msg.Type);
+                            setState(LineAddress, State:M);
+                        }else{
+							entry.Sharers.clear(); 
+                            DPRINTF(RubySlicc, "Switch %#x %s: %s -> M\n", LineAddress, st, in_msg.Type);
+                            setState(LineAddress, State:M);
+                        }
+                        respFromCache_in.dequeue(clockEdge());
+                    }else if(in_msg.Type == CoherenceMessageType:Upgrade){
+                        enqueue(fwdToCache_out, CoherenceMessage, 1) {
+                            out_msg.LineAddress := LineAddress;
+                            out_msg.Type := CoherenceMessageType:Fwd_GetM;
+                            out_msg.Sender := in_msg.Sender;
+                            out_msg.Destination.addNetDest(entry.Owner);
+                            //out_msg.cl := entry.cl;
+                            //out_msg.acksExpected := 0;
+                            out_msg.MessageSize := MessageSizeType:Control;
+                        }
+                        entry.Owner.clear();
+                        entry.Owner.add(in_msg.Sender);
+						entry.Sharers.clear(); 
+                        DPRINTF(RubySlicc, "Switch %#x %s: %s -> M\n", LineAddress, st, in_msg.Type);
+                        setState(LineAddress, State:M);
+                        respFromCache_in.dequeue(clockEdge());
+                    }else{
+                        // stall
+                    }
+                }else if (st == State:S){
+                    if (in_msg.Type == CoherenceMessageType:GetM){
+			    if (entry.Sharers.isElement(in_msg.Sender)){
+		                    entry.Sharers.remove(in_msg.Sender);
+		                    enqueue(respToCache_out, CoherenceMessage, 1) {
+                                out_msg.LineAddress := LineAddress;
+                                out_msg.Type := CoherenceMessageType:GetM_Ack_AD;
+                                out_msg.Sender := machineID;
+                                out_msg.Destination.add(in_msg.Sender);
+                                out_msg.cl := entry.cl;
+                                out_msg.acksExpected := entry.Sharers.count();
+                                out_msg.MessageSize := MessageSizeType:Control;
+                            }
+							//entry.Sharers.clear(); 
+                            DPRINTF(RubySlicc, "Switch %#x %s: %s -> M\n", LineAddress, st, in_msg.Type);
+		                    //setState(LineAddress, State:M);
+                            //entry.Sharers.remove(in_msg.Sender);
+                            enqueue(fwdToCache_out, CoherenceMessage, 1) {
+                                out_msg.LineAddress := LineAddress;
+                                out_msg.Type := CoherenceMessageType:Inv;
+                                out_msg.Sender := in_msg.Sender; //(1)
+                                out_msg.Destination.addNetDest(entry.Sharers);
+                                //out_msg.cl := entry.cl;
+                                //out_msg.acksExpected := 0;
+                                out_msg.MessageSize := MessageSizeType:Control;
+                            }
+		                    entry.Owner.clear();
+                            entry.Owner.add(in_msg.Sender);
+		                    entry.Sharers.clear();
+                            setState(LineAddress, State:M);
+		                    respFromCache_in.dequeue(clockEdge());
+                        }else{
+                            enqueue(respToCache_out, CoherenceMessage, 1) {
+                                out_msg.LineAddress := LineAddress;
+                                out_msg.Type := CoherenceMessageType:GetM_Ack_AD;
+                                out_msg.Sender := machineID;//(5)
+                                out_msg.Destination.add(in_msg.Sender);
+                                out_msg.cl := entry.cl;
+                                out_msg.acksExpected := entry.Sharers.count();
+                                out_msg.MessageSize := MessageSizeType:Control;
+                            }
+							//entry.Sharers.clear(); 
+                            DPRINTF(RubySlicc, "Switch %#x %s: %s -> M\n", LineAddress, st, in_msg.Type);
+                            //setState(LineAddress, State:M);
+                            entry.Sharers.remove(in_msg.Sender);
+                            enqueue(fwdToCache_out, CoherenceMessage, 1) {
+                                out_msg.LineAddress := LineAddress;
+                                out_msg.Type := CoherenceMessageType:Inv;
+                                out_msg.Sender := in_msg.Sender;
+                                out_msg.Destination.addNetDest(entry.Sharers);
+                                //out_msg.cl := entry.cl;
+                                //out_msg.acksExpected := 0;
+                                out_msg.MessageSize := MessageSizeType:Control;
+                            }
+                            entry.Owner.clear();
+                            entry.Owner.add(in_msg.Sender);
+                            entry.Sharers.clear();
+                            setState(LineAddress, State:M);
+                            respFromCache_in.dequeue(clockEdge());
+                        }
+                    }else if (in_msg.Type == CoherenceMessageType:GetS){
+                        entry.Sharers.add(in_msg.Sender);
+                        enqueue(respToCache_out, CoherenceMessage, 1) {
+                            out_msg.LineAddress := LineAddress;
+                            out_msg.Type := CoherenceMessageType:GetS_Ack;
+                            out_msg.Sender := machineID;
+                            out_msg.Destination.add(in_msg.Sender);
+                            out_msg.cl := in_msg.cl;
+                            //out_msg.acksExpected := 0;
+                            out_msg.MessageSize := MessageSizeType:Control;
+                        }
+                        DPRINTF(RubySlicc, "Switch %#x %s: %s -> S\n", LineAddress, st, in_msg.Type);
+                        setState(LineAddress, State:S);
+                        respFromCache_in.dequeue(clockEdge());
+                    }else if (in_msg.Type == CoherenceMessageType:PutM){
+                       enqueue(fwdToCache_out, CoherenceMessage, 1) {
+                            out_msg.LineAddress := LineAddress;
+                            out_msg.Type := CoherenceMessageType:Put_Ack;
+                            out_msg.Sender := machineID;
+                            out_msg.Destination.add(in_msg.Sender);
+                            //out_msg.cl := in_msg.cl;
+                            //out_msg.acksExpected := 0;
+                            out_msg.MessageSize := MessageSizeType:Control;
+                        }
+                        entry.Sharers.remove(in_msg.Sender);
+                        if (entry.Owner.isElement(in_msg.Sender)){
+                            entry.cl := in_msg.cl;
+                            DPRINTF(RubySlicc, "Switch %#x %s: %s -> S\n", LineAddress, st, in_msg.Type);
+                            setState(LineAddress, State:S);
+                        }else{
+                            DPRINTF(RubySlicc, "Switch %#x %s: %s -> S\n", LineAddress, st, in_msg.Type);
+                            setState(LineAddress, State:S);
+                        }
+                        respFromCache_in.dequeue(clockEdge());
+                    }else if (in_msg.Type == CoherenceMessageType:PutS){
+                        enqueue(fwdToCache_out, CoherenceMessage, 1) {
+                            out_msg.LineAddress := LineAddress;
+                            out_msg.Type := CoherenceMessageType:Put_Ack;
+                            out_msg.Sender := machineID;
+                            out_msg.Destination.add(in_msg.Sender);
+                            out_msg.cl := entry.cl;
+                            //out_msg.acksExpected := 0;
+                            out_msg.MessageSize := MessageSizeType:Control;
+                        }
+                        entry.Sharers.remove(in_msg.Sender);
+                        if (entry.Sharers.count() == 0){
+           					entry.Owner.clear();
+							entry.Sharers.clear();
+                            DPRINTF(RubySlicc, "Switch %#x %s: %s -> I\n", LineAddress, st, in_msg.Type);
+                            setState(LineAddress, State:I);
+                        }else{
+                            DPRINTF(RubySlicc, "Switch %#x %s: %s -> S\n", LineAddress, st, in_msg.Type);
+                            setState(LineAddress, State:S);
+                        }
+                        respFromCache_in.dequeue(clockEdge());
+                    }else if (in_msg.Type == CoherenceMessageType:Upgrade){
+                        if (entry.Sharers.isElement(in_msg.Sender)){
+                            entry.Sharers.remove(in_msg.Sender);
+                            enqueue(respToCache_out, CoherenceMessage, 1) {
+                                out_msg.LineAddress := LineAddress;
+                                out_msg.Type := CoherenceMessageType:GetM_Ack_AD;
+                                out_msg.Sender := machineID;
+                                out_msg.Destination.add(in_msg.Sender);
+                                out_msg.cl := entry.cl;
+                                out_msg.acksExpected := entry.Sharers.count();
+                                out_msg.MessageSize := MessageSizeType:Control;
+                            }
+                            DPRINTF(RubySlicc, "Switch %#x %s: %s -> M\n", LineAddress, st, in_msg.Type);
+                            //setState(LineAddress, State:M);
+                            enqueue(fwdToCache_out, CoherenceMessage, 1) {
+                                out_msg.LineAddress := LineAddress;
+                                out_msg.Type := CoherenceMessageType:Inv;
+                                out_msg.Sender := in_msg.Sender;
+                                out_msg.Destination.addNetDest(entry.Sharers);
+                                //out_msg.cl := entry.cl;
+                                //out_msg.acksExpected := 0;
+                                out_msg.MessageSize := MessageSizeType:Control;
+                            }
+                            entry.Owner.clear();
+                            entry.Owner.add(in_msg.Sender);
+                            entry.Sharers.clear();
+                            setState(LineAddress, State:M);
+                            respFromCache_in.dequeue(clockEdge());
+                        }else{
+                            enqueue(respToCache_out, CoherenceMessage, 1) {
+                                out_msg.LineAddress := LineAddress;
+                                out_msg.Type := CoherenceMessageType:GetM_Ack_AD;
+                                out_msg.Sender := machineID;
+                                out_msg.Destination.add(in_msg.Sender);
+                                out_msg.cl := entry.cl;
+                                out_msg.acksExpected := entry.Sharers.count();
+                                out_msg.MessageSize := MessageSizeType:Control;
+                            }
+                            DPRINTF(RubySlicc, "Switch %#x %s: %s -> M\n", LineAddress, st, in_msg.Type);
+                            //setState(LineAddress, State:M);
+							entry.Sharers.remove(in_msg.Sender);//(2)
+                            enqueue(fwdToCache_out, CoherenceMessage, 1) {
+                                out_msg.LineAddress := LineAddress;
+                                out_msg.Type := CoherenceMessageType:Inv;
+                                out_msg.Sender := in_msg.Sender;
+                                out_msg.Destination.addNetDest(entry.Sharers);
+                                //out_msg.cl := entry.cl;
+                                //out_msg.acksExpected := 0;
+                                out_msg.MessageSize := MessageSizeType:Control;
+                            }
+                            entry.Owner.clear();
+                            entry.Owner.add(in_msg.Sender);
+                            entry.Sharers.clear();
+                            setState(LineAddress, State:M);
+                            respFromCache_in.dequeue(clockEdge());
+                        }
+                    }else{
+                        // stall
+                    }
+                }else if (st == State:M_GetS){
+                    if(in_msg.Type == CoherenceMessageType:WB){
+                        if (entry.Owner.isElement(in_msg.Sender)){
+                            entry.cl := in_msg.cl;
+                            DPRINTF(RubySlicc, "Switch %#x %s: %s -> S\n", LineAddress, st, in_msg.Type);
+                            setState(LineAddress, State:S);
+                        }else{
+                            DPRINTF(RubySlicc, "Switch %#x %s: %s -> M_GetS\n", LineAddress, st, in_msg.Type);
+                            setState(LineAddress, State:M_GetS);
+                        }
+                        respFromCache_in.dequeue(clockEdge());
+                    }else{
+                        //stall
+                    }
+                }else{
+                    // stall
+                }
+            }
+        }
+    }
+
+    in_port(reqFromCache_in, CoherenceMessage, reqFromCache) {
+        if (reqFromCache_in.isReady(clockEdge())) {
+            peek(reqFromCache_in, CoherenceMessage) {
+                Entry entry := getDirectoryEntry(in_msg.LineAddress);
+                State st := getState(in_msg.LineAddress);
+                Addr LineAddress := in_msg.LineAddress;
+                if (st == State:I) {
+                    if (in_msg.Type == CoherenceMessageType:GetM) {
+                        enqueue(respToCache_out, CoherenceMessage, 1) {
+                            out_msg.LineAddress := LineAddress;
+                            out_msg.Type := CoherenceMessageType:Data;
+                            out_msg.Sender := machineID;
+                            out_msg.Destination.add(in_msg.Sender);
+                            out_msg.cl := entry.cl;
+                            out_msg.MessageSize := MessageSizeType:Data;
+                            if (entry.Owner.isElement(in_msg.Sender)){
+                                out_msg.Acks := entry.Sharers.count();
+                            }else{
+                                out_msg.Acks := 0;
+                            }
+                        }
+                        entry.Owner.clear();
+                        entry.Owner.add(in_msg.Sender);
+						entry.Sharers.clear(); 
+                        DPRINTF(RubySlicc, "Switch %#x %s: %s -> M\n", LineAddress, st, in_msg.Type);
+						setState(LineAddress, State:M);                
+                        reqFromCache_in.dequeue(clockEdge());
+                    }else if (in_msg.Type == CoherenceMessageType:GetS){
+                        entry.Sharers.add(in_msg.Sender);
+                        enqueue(respToCache_out, CoherenceMessage, 1) {
+                            out_msg.LineAddress := LineAddress;
+                            out_msg.Type := CoherenceMessageType:Data;
+                            out_msg.Sender := machineID;
+                            out_msg.Destination.add(in_msg.Sender);
+                            out_msg.cl := entry.cl;
+                            out_msg.MessageSize := MessageSizeType:Data;
+                            if (entry.Owner.isElement(in_msg.Sender)){
+                                out_msg.Acks := entry.Sharers.count();
+                            }else{
+                                out_msg.Acks := 0;
+                            }
+                        }
+                        DPRINTF(RubySlicc, "Switch %#x %s: %s -> S\n", LineAddress, st, in_msg.Type);
+                        setState(LineAddress, State:S);
+                        reqFromCache_in.dequeue(clockEdge());
+                    }else if (in_msg.Type == CoherenceMessageType:PutM){
+                        if (entry.Owner.isElement(in_msg.Sender)){
+                            reqFromCache_in.dequeue(clockEdge());
+                        }else{
+                            enqueue(fwdToCache_out, CoherenceMessage, 1) {
+                                out_msg.LineAddress := LineAddress;
+                                out_msg.Type := CoherenceMessageType:Put_Ack;
+                                out_msg.Sender := machineID;
+                                out_msg.Destination.add(in_msg.Sender);
+                                //out_msg.cl := entry.cl;
+                                //out_msg.acksExpected := 0;
+                                out_msg.MessageSize := MessageSizeType:Control;
+                            }
+							entry.Owner.clear();
+							entry.Sharers.clear();
+                            DPRINTF(RubySlicc, "Switch %#x %s: %s -> I\n", LineAddress, st, in_msg.Type);
+                            setState(LineAddress, State:I);
+                        }
+                        reqFromCache_in.dequeue(clockEdge());
+                    }else if (in_msg.Type == CoherenceMessageType:PutS){
+                        enqueue(fwdToCache_out, CoherenceMessage, 1) {
+                            out_msg.LineAddress := LineAddress;
+                            out_msg.Type := CoherenceMessageType:Put_Ack;
+                            out_msg.Sender := machineID;
+                            out_msg.Destination.add(in_msg.Sender);
+                            out_msg.cl := entry.cl;
+                            //out_msg.acksExpected := 0;
+                            out_msg.MessageSize := MessageSizeType:Control;
+                        }
+                        entry.Sharers.remove(in_msg.Sender);
+                        if (entry.Sharers.count() == 0){
+                    		entry.Owner.clear();
+							entry.Sharers.clear();
+                            DPRINTF(RubySlicc, "Switch %#x %s: %s -> I\n", LineAddress, st, in_msg.Type);
+                            setState(LineAddress, State:I);
+                        }else{
+							entry.Owner.clear();
+							entry.Sharers.clear();
+                            DPRINTF(RubySlicc, "Switch %#x %s: %s -> I\n", LineAddress, st, in_msg.Type);
+                            setState(LineAddress, State:I);
+                        }
+                        reqFromCache_in.dequeue(clockEdge());
+                    }else if (in_msg.Type == CoherenceMessageType:Upgrade){
+                        enqueue(respToCache_out, CoherenceMessage, 1) {
+                            out_msg.LineAddress := LineAddress;
+                            out_msg.Type := CoherenceMessageType:GetM_Ack_AD;
+                            out_msg.Sender := machineID;
+                            out_msg.Destination.add(in_msg.Sender);
+                            out_msg.cl := entry.cl;
+                            out_msg.acksExpected := entry.Sharers.count();
+                            out_msg.MessageSize := MessageSizeType:Control;
+                        }
+			entry.Owner.clear();
+                        entry.Owner.add(in_msg.Sender);
+			entry.Sharers.clear(); 
+                        DPRINTF(RubySlicc, "Switch %#x %s: %s -> M\n", LineAddress, st, in_msg.Type);
+                        setState(LineAddress, State:M);
+                        reqFromCache_in.dequeue(clockEdge());
+                    }else{
+                        // stall
+                    }
+                }else if (st == State:M){
+                    if (in_msg.Type == CoherenceMessageType:GetM){
+                        enqueue(fwdToCache_out, CoherenceMessage, 1) {
+                            out_msg.LineAddress := LineAddress;
+                            out_msg.Type := CoherenceMessageType:Fwd_GetM;
+                            out_msg.Sender := in_msg.Sender;
+                            out_msg.Destination.addNetDest(entry.Owner);
+                            //out_msg.cl := entry.cl;
+                            //out_msg.acksExpected := 0;
+                            out_msg.MessageSize := MessageSizeType:Control;
+                        }
+                        entry.Owner.clear();
+                        entry.Owner.add(in_msg.Sender);
+						entry.Sharers.clear(); 
+                        DPRINTF(RubySlicc, "Switch %#x %s: %s -> M\n", LineAddress, st, in_msg.Type);
+                        setState(LineAddress, State:M);
+                        reqFromCache_in.dequeue(clockEdge());
+                    }else if(in_msg.Type == CoherenceMessageType:GetS){
+                        enqueue(fwdToCache_out, CoherenceMessage, 1) {
+                            out_msg.LineAddress := LineAddress;
+                            out_msg.Type := CoherenceMessageType:Fwd_GetS;
+                            out_msg.Sender := in_msg.Sender;
+                            out_msg.Destination.addNetDest(entry.Owner);
+                            //out_msg.cl := entry.cl;
+                            //out_msg.acksExpected := 0;
+                            out_msg.MessageSize := MessageSizeType:Control;
+                        }
+                        entry.Sharers.add(in_msg.Sender);
+                        entry.Sharers.addNetDest(entry.Owner);
+                        DPRINTF(RubySlicc, "Switch %#x %s: %s -> M_GetS\n", LineAddress, st, in_msg.Type);
+                        setState(LineAddress, State:M_GetS);
+                        reqFromCache_in.dequeue(clockEdge());
+                    }else if(in_msg.Type == CoherenceMessageType:PutM){
+                        enqueue(fwdToCache_out, CoherenceMessage, 1) {
+                            out_msg.LineAddress := LineAddress;
+                            out_msg.Type := CoherenceMessageType:Put_Ack;
+                            out_msg.Sender := machineID;
+                            out_msg.Destination.add(in_msg.Sender);
+                            //out_msg.cl := entry.cl;
+                            //out_msg.acksExpected := 0;
+                            out_msg.MessageSize := MessageSizeType:Control;
+                        }
+                        entry.Sharers.remove(in_msg.Sender);
+                        if (entry.Owner.isElement(in_msg.Sender)){
+                            entry.cl := in_msg.cl;
+							entry.Owner.clear();
+							entry.Sharers.clear();
+                            DPRINTF(RubySlicc, "Switch %#x %s: %s -> I\n", LineAddress, st, in_msg.Type);
+                            setState(LineAddress, State:I);
+                        }else{
+							entry.Sharers.clear(); 
+                            DPRINTF(RubySlicc, "Switch %#x %s: %s -> M\n", LineAddress, st, in_msg.Type);
+                            setState(LineAddress, State:M);
+                        }
+                        reqFromCache_in.dequeue(clockEdge());
+                    }else if(in_msg.Type == CoherenceMessageType:PutS){
+                        enqueue(fwdToCache_out, CoherenceMessage, 1) {
+                            out_msg.LineAddress := LineAddress;
+                            out_msg.Type := CoherenceMessageType:Put_Ack;
+                            out_msg.Sender := machineID;
+                            out_msg.Destination.add(in_msg.Sender);
+                            out_msg.cl := entry.cl;
+                            //out_msg.acksExpected := 0;
+                            out_msg.MessageSize := MessageSizeType:Control;
+                        }
+                        entry.Sharers.remove(in_msg.Sender);
+                        if (entry.Sharers.count() == 0){
+							entry.Sharers.clear(); 
+                            DPRINTF(RubySlicc, "Switch %#x %s: %s -> M\n", LineAddress, st, in_msg.Type);
+                            setState(LineAddress, State:M);
+                        }else{
+							entry.Sharers.clear(); 
+                            DPRINTF(RubySlicc, "Switch %#x %s: %s -> M\n", LineAddress, st, in_msg.Type);
+                            setState(LineAddress, State:M);
+                        }
+                        reqFromCache_in.dequeue(clockEdge());
+                    }else if(in_msg.Type == CoherenceMessageType:Upgrade){
+                        enqueue(fwdToCache_out, CoherenceMessage, 1) {
+                            out_msg.LineAddress := LineAddress;
+                            out_msg.Type := CoherenceMessageType:Fwd_GetM;
+                            out_msg.Sender := in_msg.Sender;
+                            out_msg.Destination.addNetDest(entry.Owner);
+                            //out_msg.cl := entry.cl;
+                            //out_msg.acksExpected := 0;
+                            out_msg.MessageSize := MessageSizeType:Control;
+                        }
+                        entry.Owner.clear();
+                        entry.Owner.add(in_msg.Sender);
+						entry.Sharers.clear(); 
+                        DPRINTF(RubySlicc, "Switch %#x %s: %s -> M\n", LineAddress, st, in_msg.Type);
+                        setState(LineAddress, State:M);
+                        reqFromCache_in.dequeue(clockEdge());
+                    }else{
+                        // stall
+                    }
+                }else if (st == State:S){
+                    if (in_msg.Type == CoherenceMessageType:GetM){
+			    if (entry.Sharers.isElement(in_msg.Sender)){
+		                    entry.Sharers.remove(in_msg.Sender);
+		                    enqueue(respToCache_out, CoherenceMessage, 1) {
+                                out_msg.LineAddress := LineAddress;
+                                out_msg.Type := CoherenceMessageType:GetM_Ack_AD;
+                                out_msg.Sender := machineID;
+                                out_msg.Destination.add(in_msg.Sender);
+                                out_msg.cl := entry.cl;
+                                out_msg.acksExpected := entry.Sharers.count();
+                                out_msg.MessageSize := MessageSizeType:Control;
+                            }
+							//entry.Sharers.clear(); 
+                            DPRINTF(RubySlicc, "Switch %#x %s: %s -> M\n", LineAddress, st, in_msg.Type);
+		                    //setState(LineAddress, State:M);
+                            //entry.Sharers.remove(in_msg.Sender);
+                            enqueue(fwdToCache_out, CoherenceMessage, 1) {
+                                out_msg.LineAddress := LineAddress;
+                                out_msg.Type := CoherenceMessageType:Inv;
+                                out_msg.Sender := in_msg.Sender;//(3)
+                                out_msg.Destination.addNetDest(entry.Sharers);
+                                //out_msg.cl := entry.cl;
+                                //out_msg.acksExpected := 0;
+                                out_msg.MessageSize := MessageSizeType:Control;
+                            }
+		                    entry.Owner.clear();
+                            entry.Owner.add(in_msg.Sender);
+		                    entry.Sharers.clear();
+                            setState(LineAddress, State:M);
+		                    reqFromCache_in.dequeue(clockEdge());
+                        }else{
+                            enqueue(respToCache_out, CoherenceMessage, 1) {
+                                out_msg.LineAddress := LineAddress;
+                                out_msg.Type := CoherenceMessageType:GetM_Ack_AD;
+                                out_msg.Sender := machineID;//(6)
+                                out_msg.Destination.add(in_msg.Sender);
+                                out_msg.cl := entry.cl;
+                                out_msg.acksExpected := entry.Sharers.count();
+                                out_msg.MessageSize := MessageSizeType:Control;
+                            }
+							//entry.Sharers.clear(); 
+                            DPRINTF(RubySlicc, "Switch %#x %s: %s -> M\n", LineAddress, st, in_msg.Type);
+                            //setState(LineAddress, State:M);
+                            entry.Sharers.remove(in_msg.Sender);
+                            enqueue(fwdToCache_out, CoherenceMessage, 1) {
+                                out_msg.LineAddress := LineAddress;
+                                out_msg.Type := CoherenceMessageType:Inv;
+                                out_msg.Sender := in_msg.Sender;
+                                out_msg.Destination.addNetDest(entry.Sharers);
+                                //out_msg.cl := entry.cl;
+                                //out_msg.acksExpected := 0;
+                                out_msg.MessageSize := MessageSizeType:Control;
+                            }
+                            entry.Owner.clear();
+                            entry.Owner.add(in_msg.Sender);
+                            entry.Sharers.clear();
+                            setState(LineAddress, State:M);
+                            reqFromCache_in.dequeue(clockEdge());
+                        }
+                    }else if (in_msg.Type == CoherenceMessageType:GetS){
+                        entry.Sharers.add(in_msg.Sender);
+                        enqueue(respToCache_out, CoherenceMessage, 1) {
+                            out_msg.LineAddress := LineAddress;
+                            out_msg.Type := CoherenceMessageType:GetS_Ack;
+                            out_msg.Sender := machineID;
+                            out_msg.Destination.add(in_msg.Sender);
+                            out_msg.cl := in_msg.cl;
+                            //out_msg.acksExpected := 0;
+                            out_msg.MessageSize := MessageSizeType:Control;
+                        }
+                        DPRINTF(RubySlicc, "Switch %#x %s: %s -> S\n", LineAddress, st, in_msg.Type);
+                        setState(LineAddress, State:S);
+                        reqFromCache_in.dequeue(clockEdge());
+                    }else if (in_msg.Type == CoherenceMessageType:PutM){
+                       enqueue(fwdToCache_out, CoherenceMessage, 1) {
+                            out_msg.LineAddress := LineAddress;
+                            out_msg.Type := CoherenceMessageType:Put_Ack;
+                            out_msg.Sender := machineID;
+                            out_msg.Destination.add(in_msg.Sender);
+                            //out_msg.cl := in_msg.cl;
+                            //out_msg.acksExpected := 0;
+                            out_msg.MessageSize := MessageSizeType:Control;
+                        }
+                        entry.Sharers.remove(in_msg.Sender);
+                        if (entry.Owner.isElement(in_msg.Sender)){
+                            entry.cl := in_msg.cl;
+                            DPRINTF(RubySlicc, "Switch %#x %s: %s -> S\n", LineAddress, st, in_msg.Type);
+                            setState(LineAddress, State:S);
+                        }else{
+                            DPRINTF(RubySlicc, "Switch %#x %s: %s -> S\n", LineAddress, st, in_msg.Type);
+                            setState(LineAddress, State:S);
+                        }
+                        reqFromCache_in.dequeue(clockEdge());
+                    }else if (in_msg.Type == CoherenceMessageType:PutS){
+                        enqueue(fwdToCache_out, CoherenceMessage, 1) {
+                            out_msg.LineAddress := LineAddress;
+                            out_msg.Type := CoherenceMessageType:Put_Ack;
+                            out_msg.Sender := machineID;
+                            out_msg.Destination.add(in_msg.Sender);
+                            out_msg.cl := entry.cl;
+                            //out_msg.acksExpected := 0;
+                            out_msg.MessageSize := MessageSizeType:Control;
+                        }
+                        entry.Sharers.remove(in_msg.Sender);
+                        if (entry.Sharers.count() == 0){
+           					entry.Owner.clear();
+							entry.Sharers.clear();
+                            DPRINTF(RubySlicc, "Switch %#x %s: %s -> I\n", LineAddress, st, in_msg.Type);
+                            setState(LineAddress, State:I);
+                        }else{
+                            DPRINTF(RubySlicc, "Switch %#x %s: %s -> S\n", LineAddress, st, in_msg.Type);
+                            setState(LineAddress, State:S);
+                        }
+                        reqFromCache_in.dequeue(clockEdge());
+                    }else if (in_msg.Type == CoherenceMessageType:Upgrade){
+                        if (entry.Sharers.isElement(in_msg.Sender)){
+                            entry.Sharers.remove(in_msg.Sender);
+                            enqueue(respToCache_out, CoherenceMessage, 1) {
+                                out_msg.LineAddress := LineAddress;
+                                out_msg.Type := CoherenceMessageType:GetM_Ack_AD;
+                                out_msg.Sender := machineID;
+                                out_msg.Destination.add(in_msg.Sender);
+                                out_msg.cl := entry.cl;
+                                out_msg.acksExpected := entry.Sharers.count();
+                                out_msg.MessageSize := MessageSizeType:Control;
+                            }
+                            DPRINTF(RubySlicc, "Switch %#x %s: %s -> M\n", LineAddress, st, in_msg.Type);
+                            //setState(LineAddress, State:M);
+                            enqueue(fwdToCache_out, CoherenceMessage, 1) {
+                                out_msg.LineAddress := LineAddress;
+                                out_msg.Type := CoherenceMessageType:Inv;
+                                out_msg.Sender := in_msg.Sender;
+                                out_msg.Destination.addNetDest(entry.Sharers);
+                                //out_msg.cl := entry.cl;
+                                //out_msg.acksExpected := 0;
+                                out_msg.MessageSize := MessageSizeType:Control;
+                            }
+                            entry.Owner.clear();
+                            entry.Owner.add(in_msg.Sender);
+                            entry.Sharers.clear();
+                            setState(LineAddress, State:M);
+                            reqFromCache_in.dequeue(clockEdge());
+                        }else{
+                            enqueue(respToCache_out, CoherenceMessage, 1) {
+                                out_msg.LineAddress := LineAddress;
+                                out_msg.Type := CoherenceMessageType:GetM_Ack_AD;
+                                out_msg.Sender := machineID;
+                                out_msg.Destination.add(in_msg.Sender);
+                                out_msg.cl := entry.cl;
+                                out_msg.acksExpected := entry.Sharers.count();
+                                out_msg.MessageSize := MessageSizeType:Control;
+                            }
+                            DPRINTF(RubySlicc, "Switch %#x %s: %s -> M\n", LineAddress, st, in_msg.Type);
+                            //setState(LineAddress, State:M);
+							entry.Sharers.remove(in_msg.Sender);//(4)
+                            enqueue(fwdToCache_out, CoherenceMessage, 1) {
+                                out_msg.LineAddress := LineAddress;
+                                out_msg.Type := CoherenceMessageType:Inv;
+                                out_msg.Sender := in_msg.Sender;
+                                out_msg.Destination.addNetDest(entry.Sharers);
+                                //out_msg.cl := entry.cl;
+                                //out_msg.acksExpected := 0;
+                                out_msg.MessageSize := MessageSizeType:Control;
+                            }
+                            entry.Owner.clear();
+                            entry.Owner.add(in_msg.Sender);
+                            entry.Sharers.clear();
+                            setState(LineAddress, State:M);
+                            reqFromCache_in.dequeue(clockEdge());
+                        }
+                    }else{
+                        // stall
+                    }
+                }else if (st == State:M_GetS){
+                    if(in_msg.Type == CoherenceMessageType:WB){
+                        if (entry.Owner.isElement(in_msg.Sender)){
+                            entry.cl := in_msg.cl;
+                            DPRINTF(RubySlicc, "Switch %#x %s: %s -> S\n", LineAddress, st, in_msg.Type);
+                            setState(LineAddress, State:S);
+                        }else{
+                            DPRINTF(RubySlicc, "Switch %#x %s: %s -> M_GetS\n", LineAddress, st, in_msg.Type);
+                            setState(LineAddress, State:M_GetS);
+                        }
+                        reqFromCache_in.dequeue(clockEdge());
+                    }else{
+                        //stall
+                    }
+                }else{
+                    // stall
+                }
+            }
+        }
+    }
+}

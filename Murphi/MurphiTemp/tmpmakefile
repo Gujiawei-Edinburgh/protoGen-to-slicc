@@ -1,0 +1,18 @@
+TARGET = $0$
+
+MURPHIPATH = /Users/gujiawei/Desktop/Edinburgh/MscProject/cmurphi
+INCLUDEPATH = ${MURPHIPATH}/include
+SRCPATH = ${MURPHIPATH}/src
+CFLAGS = -O2
+
+all: ${TARGET}
+
+${TARGET}: ${TARGET}.cpp
+	g++ ${CFLAGS} -o ${TARGET} ${TARGET}.cpp -I${INCLUDEPATH}
+
+${TARGET}.cpp: ${TARGET}.m
+	${SRCPATH}/mu ${TARGET}.m
+
+.PHONY: clean
+clean:
+	-rm -i ${TARGET} SSP_${TARGET} *.cpp *.m *.txt

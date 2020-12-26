@@ -1,0 +1,33 @@
+enumeration(CoherenceMessageType, desc="Types of request messages") {GetM,	desc="... TODO ...";
+GetM_Ack_AD,	desc="... TODO ...";
+Inv_Ack,	desc="... TODO ...";
+Fwd_GetM,	desc="... TODO ...";
+WB,	desc="... TODO ...";
+GetS_Ack,	desc="... TODO ...";
+Upgrade,	desc="... TODO ...";
+GetM_Ack_D,	desc="... TODO ...";
+Put_Ack,	desc="... TODO ...";
+PutS,	desc="... TODO ...";
+Inv,	desc="... TODO ...";
+GetS,	desc="... TODO ...";
+Fwd_GetS,	desc="... TODO ...";
+PutM,	desc="... TODO ...";
+}
+
+structure(CoherenceMessage, desc="Used for Cache->Dir and Fwd messages", interface="Message") {
+    Addr LineAddress,                   desc="Physical address for this request";
+    CoherenceMessageType Type,          desc="Type of message";
+    MachineID Sender,                   desc="Node who initiated the request";
+    NetDest Destination,                desc="Multicast destination mask";
+    DataBlock cl,                       desc="data for the cache line";
+    int acksExpected,                   desc="ack expected";
+    MessageSizeType MessageSize,        desc="size category of the message";
+
+    bool functionalRead(Packet *pkt) {
+        return false;
+    }
+
+    bool functionalWrite(Packet *pkt) {
+        return testAndWrite(LineAddress, cl, pkt);
+    }
+}

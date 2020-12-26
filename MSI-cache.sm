@@ -1,0 +1,2674 @@
+machine(MachineType:L1Cache, "MSI cache")
+    :   Sequencer *sequencer;
+        CacheMemory *cacheMemory;
+        bool send_evictions;
+	    Cycles responseLatency := 1;
+
+        MessageBuffer *mandatoryQueue;
+
+        MessageBuffer *fwdTo, network="To", virtual_network="2", vnet_type="fwd";
+        MessageBuffer *fwdFrom, network="From", virtual_network="2", vnet_type="fwd";
+        MessageBuffer *respTo, network="To", virtual_network="3", vnet_type="resp";
+        MessageBuffer *respFrom, network="From", virtual_network="3", vnet_type="resp";
+        MessageBuffer *reqTo, network="To", virtual_network="4", vnet_type="req";
+        MessageBuffer *reqFrom, network="From", virtual_network="4", vnet_type="req";
+{
+    state_declaration(State, desc="Cache states", default="L1Cache_State_I") {
+        I, AccessPermission:Invalid, desc="invalid";
+        I_load, AccessPermission:Invalid, desc="invalid load";
+        I_load_Inv_I, AccessPermission:Invalid, desc="invalid load inv invalid";
+        I_store, AccessPermission:Invalid, desc="invalid store";
+        I_store_GetM_Ack_AD, AccessPermission:Invalid, desc="Invalidation store_GetM_Ack_AD";
+        I_store_GetM_Ack_AD_Fwd_GetM_I, AccessPermission:Invalid, desc="Invalidation store_GetM_Ack_AD_Fwd_GetM_I";
+        I_store_GetM_Ack_AD_Fwd_GetS_S, AccessPermission:Invalid, desc="Invalidation store_GetM_Ack_AD_Fwd_GetS_S";
+        I_store_GetM_Ack_AD_Fwd_GetS_S_Inv_I, AccessPermission:Invalid, desc="Invalidation store_GetM_Ack_AD_Fwd_GetS_S_Inv_I";
+        I_store_Fwd_GetM_I, AccessPermission:Invalid, desc="Invalidation store_Fwd_GetM_I";
+        I_store_Fwd_GetS_S, AccessPermission:Invalid, desc="Invalidation store_Fwd_GetS_S";
+        I_store_Fwd_GetS_S_Inv_I, AccessPermission:Invalid, desc="Invalidation store_Fwd_GetS_S_Inv_I";
+        M, AccessPermission:Read_Write, desc="modified";
+        M_evict, AccessPermission:Invalid, desc="modified eviction";
+        M_evict_Fwd_GetM, AccessPermission:Invalid, desc="modified evict_Fwd_GetM";
+        S, AccessPermission:Read_Only, desc="shared";
+        S_evict, AccessPermission:Invalid, desc="shared evict";
+        S_store, AccessPermission:Read_Only, desc="shared store";
+        S_store_GetM_Ack_AD, AccessPermission:Read_Only, desc="shared store_GetM_Ack_AD";
+        S_store_GetM_Ack_AD_Fwd_GetS_S, AccessPermission:Read_Only, desc="shared store_GetM_Ack_AD_Fwd_GetS_S";
+        S_store_Fwd_GetS_S, AccessPermission:Read_Only, desc="shared store_GetM_Ack_AD_Fwd_GetS_S";
+    }
+ 
+    enumeration(Event, desc="Cache events") {
+        SloadSEvent, desc="S->S upon local load hit.";
+        MloadMEvent, desc="M->M upon local load hit.";
+        MstoreMEvent, desc="M->M upon local store hit.";
+        deallocfwdfrom_in, desc="Event indicating the cacheMemory line should be deallocated following a message received on fwdfrom_in.";
+        deallocrespfrom_in, desc="Event indicating the cacheMemory line should be deallocated following a message received on respfrom_in.";
+        deallocreqfrom_in, desc="Event indicating the cacheMemory line should be deallocated following a message received on reqfrom_in.";
+        allocI_store, desc="Event indicating cacheMemory entry alloc before moving to I_store.";
+        allocI_load, desc="Event indicating cacheMemory entry alloc before moving to I_load.";
+    }
+    
+    structure(Entry, desc="Stored variables of the  machine", interface="AbstractCacheEntry") {
+        State CacheState, desc="Cache state";
+        DataBlock clL1, desc="data block";
+        int acksReceivedL1, default=0, desc="received acks";
+        int acksExpectedL1, default=0, desc="expected acks";
+    }
+  
+    structure(TBE, desc="TBE entries for L1Cache machine") {
+        Addr PhysicalAddress, desc="physical address";
+        State TBEState,       desc="Transient State";
+        DataBlock DataBlk,    desc="Data to be written";
+    }
+  
+    structure(TBETable, external="yes"){
+        TBE lookup(Addr);
+        void allocate(Addr);
+        void deallocate(Addr);
+        bool isPresent(Addr);
+    }
+  
+    TBETable TBEs, template="<L1Cache_TBE>", constructor="m_number_of_TBEs";
+  
+    void set_tbe(TBE b);
+    void unset_tbe();
+    Tick clockEdge();
+    void set_cache_entry(AbstractCacheEntry a);
+    void unset_cache_entry();
+  
+    MachineID mapAddressToMachine(Addr addr, MachineType mtype);
+    
+    Entry getCacheEntry(Addr LineAddress), return_by_pointer="yes" {
+        return static_cast(Entry, "pointer", cacheMemory.lookup(LineAddress));
+    }
+  
+    State getState(TBE tbe, Entry cache_entry, Addr LineAddress) {
+        if (is_valid(tbe)) {
+            return tbe.TBEState;
+        } else if (is_valid(cache_entry)) {
+            return cache_entry.CacheState;
+        } else {
+            return State:I;
+        }
+    }
+  
+    void setState(TBE tbe, Entry cache_entry, Addr LineAddress, State state) {
+        if (is_valid(tbe)) {
+	    //DPRINTF(RubySlicc, "Switch %s -> %s\n", getState(tbe, cache_entry, LineAddress), state);
+            tbe.TBEState := state;
+        }
+        if (is_valid(cache_entry)) {
+	    //DPRINTF(RubySlicc, "Switch %s -> %s\n", getState(tbe, cache_entry, LineAddress), state);
+            cache_entry.CacheState := state;
+        }
+    }
+  
+    AccessPermission getAccessPermission(Addr LineAddress) {
+        TBE tbe := TBEs[LineAddress];
+        if (is_valid(tbe)) {
+            return L1Cache_State_to_permission(tbe.TBEState);
+        }
+        Entry cache_entry := getCacheEntry(LineAddress);
+        if (is_valid(cache_entry)) {
+            return L1Cache_State_to_permission(cache_entry.CacheState);
+        } else {
+            return AccessPermission:NotPresent;
+        }
+    }
+  
+    void setAccessPermission(Entry cache_entry, Addr LineAddress, State state) {
+        if (is_valid(cache_entry)) {
+            cache_entry.changePermission(L1Cache_State_to_permission(state));
+        }
+    }
+  
+    void functionalRead(Addr addr, Packet *pkt) {
+        TBE tbe := TBEs[addr];
+        if(is_valid(tbe)) {
+            testAndRead(addr, tbe.DataBlk, pkt);
+        } else {
+            testAndRead(addr, getCacheEntry(addr).clL1, pkt);
+        }
+    }
+  
+    int functionalWrite(Addr addr, Packet *pkt) {
+        int num_functional_writes := 0;
+    
+        TBE tbe := TBEs[addr];
+        if(is_valid(tbe)) {
+            num_functional_writes := num_functional_writes + testAndWrite(addr, tbe.DataBlk, pkt);
+            return num_functional_writes;
+        }
+    
+        num_functional_writes := num_functional_writes + testAndWrite(addr, getCacheEntry(addr).clL1, pkt);
+        return num_functional_writes;
+    }
+
+    out_port(fwdto_out, CoherenceMessage, fwdTo);
+    out_port(reqto_out, CoherenceMessage, reqTo);
+    out_port(respto_out, CoherenceMessage, respTo);in_port(fwdfrom_in, CoherenceMessage, fwdFrom) {
+	if (fwdfrom_in.isReady(clockEdge())) {
+		peek (fwdfrom_in, CoherenceMessage) {
+			TBE tbe := TBEs[in_msg.LineAddress];
+			Entry entry := getCacheEntry(in_msg.LineAddress);
+			State st := getState(tbe, entry, in_msg.LineAddress);
+			Addr LineAddress := in_msg.LineAddress;
+			if (st == State:I) {
+			}
+			else if (st == State:I_load) {
+				if (in_msg.Type == CoherenceMessageType:Inv) {
+					setState(tbe, entry, LineAddress, State:I_load_Inv_I);
+					fwdfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:Inv_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:GetS_Ack) {
+					entry.clL1 := in_msg.cl;
+					setState(tbe, entry, LineAddress, State:S);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.readCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					fwdfrom_in.dequeue(clockEdge());
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:I_load_Inv_I) {
+				if (in_msg.Type == CoherenceMessageType:GetS_Ack) {
+					entry.clL1 := in_msg.cl;
+					setState(tbe, entry, LineAddress, State:I);
+					assert(is_valid(entry));
+					trigger(Event:deallocfwdfrom_in, LineAddress, entry, tbe);
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:I_store) {
+				if (in_msg.Type == CoherenceMessageType:Inv_Ack) {
+					entry.acksReceivedL1 := entry.acksReceivedL1+1;
+					setState(tbe, entry, LineAddress, State:I_store);
+					fwdfrom_in.dequeue(clockEdge());
+				}
+				else if (in_msg.Type == CoherenceMessageType:GetM_Ack_AD) {
+					entry.acksExpectedL1 := in_msg.acksExpected;
+					entry.clL1 := in_msg.cl;
+					if (entry.acksExpectedL1 == entry.acksReceivedL1)  {
+						entry.acksReceivedL1 := 0;
+					entry.acksExpectedL1 := 0;
+					setState(tbe, entry, LineAddress, State:M);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.writeCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					fwdfrom_in.dequeue(clockEdge());
+					}
+					else if(entry.acksExpectedL1 != entry.acksReceivedL1)  {
+					setState(tbe, entry, LineAddress, State:I_store_GetM_Ack_AD);
+					fwdfrom_in.dequeue(clockEdge());
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:Fwd_GetM) {
+					setState(tbe, entry, LineAddress, State:I_store_Fwd_GetM_I);
+					fwdfrom_in.dequeue(clockEdge());
+				}
+				else if (in_msg.Type == CoherenceMessageType:Fwd_GetS) {
+					setState(tbe, entry, LineAddress, State:I_store_Fwd_GetS_S);
+					fwdfrom_in.dequeue(clockEdge());
+				}
+				else if (in_msg.Type == CoherenceMessageType:GetM_Ack_D) {
+					entry.clL1 := in_msg.cl;
+					setState(tbe, entry, LineAddress, State:M);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.writeCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					fwdfrom_in.dequeue(clockEdge());
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:I_store_GetM_Ack_AD) {
+				if (in_msg.Type == CoherenceMessageType:Inv_Ack) {
+					entry.acksReceivedL1 := entry.acksReceivedL1+1;
+					if (entry.acksExpectedL1 == entry.acksReceivedL1)  {
+						entry.acksReceivedL1 := 0;
+					entry.acksExpectedL1 := 0;
+					setState(tbe, entry, LineAddress, State:M);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.writeCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					fwdfrom_in.dequeue(clockEdge());
+					}
+					else if(entry.acksExpectedL1 != entry.acksReceivedL1)  {
+					setState(tbe, entry, LineAddress, State:I_store_GetM_Ack_AD);
+					fwdfrom_in.dequeue(clockEdge());
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:Fwd_GetM) {
+					setState(tbe, entry, LineAddress, State:I_store_GetM_Ack_AD_Fwd_GetM_I);
+					fwdfrom_in.dequeue(clockEdge());
+				}
+				else if (in_msg.Type == CoherenceMessageType:Fwd_GetS) {
+					setState(tbe, entry, LineAddress, State:I_store_GetM_Ack_AD_Fwd_GetS_S);
+					fwdfrom_in.dequeue(clockEdge());
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:I_store_GetM_Ack_AD_Fwd_GetM_I) {
+				if (in_msg.Type == CoherenceMessageType:Inv_Ack) {
+					entry.acksReceivedL1 := entry.acksReceivedL1+1;
+					if (entry.acksExpectedL1 == entry.acksReceivedL1)  {
+						entry.acksReceivedL1 := 0;
+					entry.acksExpectedL1 := 0;
+					setState(tbe, entry, LineAddress, State:I_store_GetM_Ack_AD_Fwd_GetM_I);
+					fwdfrom_in.dequeue(clockEdge());
+					}
+					else if(entry.acksExpectedL1 != entry.acksReceivedL1)  {
+					setState(tbe, entry, LineAddress, State:I);
+					assert(is_valid(entry));
+					trigger(Event:deallocfwdfrom_in, LineAddress, entry, tbe);
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetM_Ack_D;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					}
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:I_store_GetM_Ack_AD_Fwd_GetS_S) {
+				if (in_msg.Type == CoherenceMessageType:Inv_Ack) {
+					entry.acksReceivedL1 := entry.acksReceivedL1+1;
+					if (entry.acksExpectedL1 == entry.acksReceivedL1)  {
+						entry.acksReceivedL1 := 0;
+					entry.acksExpectedL1 := 0;
+					setState(tbe, entry, LineAddress, State:S);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.writeCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					fwdfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetS_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(mapAddressToMachine(LineAddress, MachineType:Directory));
+						out_msg.Type := CoherenceMessageType:WB;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					}
+					else if(entry.acksExpectedL1 != entry.acksReceivedL1)  {
+					setState(tbe, entry, LineAddress, State:I_store_GetM_Ack_AD_Fwd_GetS_S);
+					fwdfrom_in.dequeue(clockEdge());
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:Inv) {
+					setState(tbe, entry, LineAddress, State:I_store_GetM_Ack_AD_Fwd_GetS_S_Inv_I);
+					fwdfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:Inv_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:I_store_GetM_Ack_AD_Fwd_GetS_S_Inv_I) {
+				if (in_msg.Type == CoherenceMessageType:Inv_Ack) {
+					entry.acksReceivedL1 := entry.acksReceivedL1+1;
+					if (entry.acksExpectedL1 == entry.acksReceivedL1)  {
+						entry.acksReceivedL1 := 0;
+					entry.acksExpectedL1 := 0;
+					setState(tbe, entry, LineAddress, State:I_store_GetM_Ack_AD_Fwd_GetS_S_Inv_I);
+					fwdfrom_in.dequeue(clockEdge());
+					}
+					else if(entry.acksExpectedL1 != entry.acksReceivedL1)  {
+					setState(tbe, entry, LineAddress, State:I);
+					assert(is_valid(entry));
+					trigger(Event:deallocfwdfrom_in, LineAddress, entry, tbe);
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetS_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(mapAddressToMachine(LineAddress, MachineType:Directory));
+						out_msg.Type := CoherenceMessageType:WB;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					}
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:I_store_Fwd_GetM_I) {
+				if (in_msg.Type == CoherenceMessageType:GetM_Ack_AD) {
+					entry.acksExpectedL1 := in_msg.acksExpected;
+					entry.clL1 := in_msg.cl;
+					if (entry.acksExpectedL1 == entry.acksReceivedL1)  {
+						entry.acksReceivedL1 := 0;
+					entry.acksExpectedL1 := 0;
+					setState(tbe, entry, LineAddress, State:I_store_GetM_Ack_AD_Fwd_GetM_I);
+					fwdfrom_in.dequeue(clockEdge());
+					}
+					else if(entry.acksExpectedL1 != entry.acksReceivedL1)  {
+					setState(tbe, entry, LineAddress, State:I);
+					assert(is_valid(entry));
+					trigger(Event:deallocfwdfrom_in, LineAddress, entry, tbe);
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetM_Ack_D;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:GetM_Ack_D) {
+					entry.clL1 := in_msg.cl;
+					setState(tbe, entry, LineAddress, State:I);
+					assert(is_valid(entry));
+					trigger(Event:deallocfwdfrom_in, LineAddress, entry, tbe);
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetM_Ack_D;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:Inv_Ack) {
+					entry.acksReceivedL1 := entry.acksReceivedL1+1;
+					setState(tbe, entry, LineAddress, State:I_store_Fwd_GetM_I);
+					fwdfrom_in.dequeue(clockEdge());
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:I_store_Fwd_GetS_S) {
+				if (in_msg.Type == CoherenceMessageType:GetM_Ack_AD) {
+					entry.acksExpectedL1 := in_msg.acksExpected;
+					entry.clL1 := in_msg.cl;
+					if (entry.acksExpectedL1 == entry.acksReceivedL1)  {
+						entry.acksReceivedL1 := 0;
+					entry.acksExpectedL1 := 0;
+					setState(tbe, entry, LineAddress, State:S);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.writeCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					fwdfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetS_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(mapAddressToMachine(LineAddress, MachineType:Directory));
+						out_msg.Type := CoherenceMessageType:WB;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					}
+					else if(entry.acksExpectedL1 != entry.acksReceivedL1)  {
+					setState(tbe, entry, LineAddress, State:I_store_GetM_Ack_AD_Fwd_GetS_S);
+					fwdfrom_in.dequeue(clockEdge());
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:Inv_Ack) {
+					entry.acksReceivedL1 := entry.acksReceivedL1+1;
+					setState(tbe, entry, LineAddress, State:I_store_Fwd_GetS_S);
+					fwdfrom_in.dequeue(clockEdge());
+				}
+				else if (in_msg.Type == CoherenceMessageType:Inv) {
+					setState(tbe, entry, LineAddress, State:I_store_Fwd_GetS_S_Inv_I);
+					fwdfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:Inv_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:GetM_Ack_D) {
+					entry.clL1 := in_msg.cl;
+					setState(tbe, entry, LineAddress, State:S);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.writeCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					fwdfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetS_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(mapAddressToMachine(LineAddress, MachineType:Directory));
+						out_msg.Type := CoherenceMessageType:WB;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:I_store_Fwd_GetS_S_Inv_I) {
+				if (in_msg.Type == CoherenceMessageType:GetM_Ack_AD) {
+					entry.acksExpectedL1 := in_msg.acksExpected;
+					entry.clL1 := in_msg.cl;
+					if (entry.acksExpectedL1 == entry.acksReceivedL1)  {
+						entry.acksReceivedL1 := 0;
+					entry.acksExpectedL1 := 0;
+					setState(tbe, entry, LineAddress, State:I_store_GetM_Ack_AD_Fwd_GetS_S_Inv_I);
+					fwdfrom_in.dequeue(clockEdge());
+					}
+					else if(entry.acksExpectedL1 != entry.acksReceivedL1)  {
+					setState(tbe, entry, LineAddress, State:I);
+					assert(is_valid(entry));
+					trigger(Event:deallocfwdfrom_in, LineAddress, entry, tbe);
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetS_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(mapAddressToMachine(LineAddress, MachineType:Directory));
+						out_msg.Type := CoherenceMessageType:WB;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:GetM_Ack_D) {
+					entry.clL1 := in_msg.cl;
+					setState(tbe, entry, LineAddress, State:I);
+					assert(is_valid(entry));
+					trigger(Event:deallocfwdfrom_in, LineAddress, entry, tbe);
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetS_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(mapAddressToMachine(LineAddress, MachineType:Directory));
+						out_msg.Type := CoherenceMessageType:WB;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:Inv_Ack) {
+					entry.acksReceivedL1 := entry.acksReceivedL1+1;
+					setState(tbe, entry, LineAddress, State:I_store_Fwd_GetS_S_Inv_I);
+					fwdfrom_in.dequeue(clockEdge());
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:M) {
+				if (in_msg.Type == CoherenceMessageType:Fwd_GetM) {
+					setState(tbe, entry, LineAddress, State:I);
+					assert(is_valid(entry));
+					trigger(Event:deallocfwdfrom_in, LineAddress, entry, tbe);
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetM_Ack_D;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:Fwd_GetS) {
+					setState(tbe, entry, LineAddress, State:S);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.readCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					fwdfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetS_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(mapAddressToMachine(LineAddress, MachineType:Directory));
+						out_msg.Type := CoherenceMessageType:WB;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:M_evict) {
+				if (in_msg.Type == CoherenceMessageType:Put_Ack) {
+					setState(tbe, entry, LineAddress, State:I);
+					assert(is_valid(entry));
+					trigger(Event:deallocfwdfrom_in, LineAddress, entry, tbe);
+				}
+				else if (in_msg.Type == CoherenceMessageType:Fwd_GetM) {
+					setState(tbe, entry, LineAddress, State:M_evict_Fwd_GetM);
+					fwdfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetM_Ack_D;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:Fwd_GetS) {
+					setState(tbe, entry, LineAddress, State:S_evict);
+					fwdfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetS_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(mapAddressToMachine(LineAddress, MachineType:Directory));
+						out_msg.Type := CoherenceMessageType:WB;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:M_evict_Fwd_GetM) {
+				if (in_msg.Type == CoherenceMessageType:Put_Ack) {
+					setState(tbe, entry, LineAddress, State:I);
+					assert(is_valid(entry));
+					trigger(Event:deallocfwdfrom_in, LineAddress, entry, tbe);
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:S) {
+				if (in_msg.Type == CoherenceMessageType:Inv) {
+					setState(tbe, entry, LineAddress, State:I);
+					assert(is_valid(entry));
+					trigger(Event:deallocfwdfrom_in, LineAddress, entry, tbe);
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:Inv_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:S_evict) {
+				if (in_msg.Type == CoherenceMessageType:Put_Ack) {
+					setState(tbe, entry, LineAddress, State:I);
+					assert(is_valid(entry));
+					trigger(Event:deallocfwdfrom_in, LineAddress, entry, tbe);
+				}
+				else if (in_msg.Type == CoherenceMessageType:Inv) {
+					setState(tbe, entry, LineAddress, State:M_evict_Fwd_GetM);
+					fwdfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:Inv_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:S_store) {
+				if (in_msg.Type == CoherenceMessageType:Inv) {
+					setState(tbe, entry, LineAddress, State:I_store);
+					fwdfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:Inv_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:Fwd_GetM) {
+					setState(tbe, entry, LineAddress, State:I_store_Fwd_GetM_I);
+					fwdfrom_in.dequeue(clockEdge());
+				}
+				else if (in_msg.Type == CoherenceMessageType:GetM_Ack_AD) {
+					entry.acksExpectedL1 := in_msg.acksExpected;
+					entry.clL1 := in_msg.cl;
+					if (entry.acksExpectedL1 == entry.acksReceivedL1)  {
+						entry.acksReceivedL1 := 0;
+					entry.acksExpectedL1 := 0;
+					setState(tbe, entry, LineAddress, State:S_store_GetM_Ack_AD);
+					fwdfrom_in.dequeue(clockEdge());
+					}
+					else if(entry.acksExpectedL1 != entry.acksReceivedL1)  {
+					setState(tbe, entry, LineAddress, State:M);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.writeCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					fwdfrom_in.dequeue(clockEdge());
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:GetM_Ack_D) {
+					setState(tbe, entry, LineAddress, State:M);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.writeCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					fwdfrom_in.dequeue(clockEdge());
+				}
+				else if (in_msg.Type == CoherenceMessageType:Inv_Ack) {
+					entry.acksReceivedL1 := entry.acksReceivedL1+1;
+					setState(tbe, entry, LineAddress, State:S_store);
+					fwdfrom_in.dequeue(clockEdge());
+				}
+				else if (in_msg.Type == CoherenceMessageType:Fwd_GetS) {
+					setState(tbe, entry, LineAddress, State:S_store_Fwd_GetS_S);
+					fwdfrom_in.dequeue(clockEdge());
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:S_store_GetM_Ack_AD) {
+				if (in_msg.Type == CoherenceMessageType:Fwd_GetM) {
+					setState(tbe, entry, LineAddress, State:I_store_GetM_Ack_AD_Fwd_GetM_I);
+					fwdfrom_in.dequeue(clockEdge());
+				}
+				else if (in_msg.Type == CoherenceMessageType:Inv_Ack) {
+					entry.acksReceivedL1 := entry.acksReceivedL1+1;
+					if (entry.acksExpectedL1 == entry.acksReceivedL1)  {
+						entry.acksReceivedL1 := 0;
+					entry.acksExpectedL1 := 0;
+					setState(tbe, entry, LineAddress, State:S_store_GetM_Ack_AD);
+					fwdfrom_in.dequeue(clockEdge());
+					}
+					else if(entry.acksExpectedL1 != entry.acksReceivedL1)  {
+					setState(tbe, entry, LineAddress, State:M);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.writeCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					fwdfrom_in.dequeue(clockEdge());
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:Fwd_GetS) {
+					setState(tbe, entry, LineAddress, State:S_store_GetM_Ack_AD_Fwd_GetS_S);
+					fwdfrom_in.dequeue(clockEdge());
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:S_store_GetM_Ack_AD_Fwd_GetS_S) {
+				if (in_msg.Type == CoherenceMessageType:Inv) {
+					setState(tbe, entry, LineAddress, State:I_store_GetM_Ack_AD_Fwd_GetS_S_Inv_I);
+					fwdfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:Inv_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:Inv_Ack) {
+					entry.acksReceivedL1 := entry.acksReceivedL1+1;
+					if (entry.acksExpectedL1 == entry.acksReceivedL1)  {
+						entry.acksReceivedL1 := 0;
+					entry.acksExpectedL1 := 0;
+					setState(tbe, entry, LineAddress, State:S_store_GetM_Ack_AD_Fwd_GetS_S);
+					fwdfrom_in.dequeue(clockEdge());
+					}
+					else if(entry.acksExpectedL1 != entry.acksReceivedL1)  {
+					setState(tbe, entry, LineAddress, State:S);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.writeCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					fwdfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetS_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(mapAddressToMachine(LineAddress, MachineType:Directory));
+						out_msg.Type := CoherenceMessageType:WB;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					}
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:S_store_Fwd_GetS_S) {
+				if (in_msg.Type == CoherenceMessageType:Inv) {
+					setState(tbe, entry, LineAddress, State:I_store_Fwd_GetS_S_Inv_I);
+					fwdfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:Inv_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:GetM_Ack_AD) {
+					entry.acksExpectedL1 := in_msg.acksExpected;
+					entry.clL1 := in_msg.cl;
+					if (entry.acksExpectedL1 == entry.acksReceivedL1)  {
+						entry.acksReceivedL1 := 0;
+					entry.acksExpectedL1 := 0;
+					setState(tbe, entry, LineAddress, State:S_store_GetM_Ack_AD_Fwd_GetS_S);
+					fwdfrom_in.dequeue(clockEdge());
+					}
+					else if(entry.acksExpectedL1 != entry.acksReceivedL1)  {
+					setState(tbe, entry, LineAddress, State:S);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.writeCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					fwdfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetS_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(mapAddressToMachine(LineAddress, MachineType:Directory));
+						out_msg.Type := CoherenceMessageType:WB;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:GetM_Ack_D) {
+					setState(tbe, entry, LineAddress, State:S);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.writeCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					fwdfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetS_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(mapAddressToMachine(LineAddress, MachineType:Directory));
+						out_msg.Type := CoherenceMessageType:WB;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:Inv_Ack) {
+					entry.acksReceivedL1 := entry.acksReceivedL1+1;
+					setState(tbe, entry, LineAddress, State:S_store_Fwd_GetS_S);
+					fwdfrom_in.dequeue(clockEdge());
+				}
+				else {
+					//stall
+				}
+			}
+			else {
+				error("Unrecognized state in in_port=respfrom_in!");
+			}
+		}
+	}
+}
+
+
+in_port(reqfrom_in, CoherenceMessage, fwdFrom) {
+	if (reqfrom_in.isReady(clockEdge())) {
+		peek (reqfrom_in, CoherenceMessage) {
+			TBE tbe := TBEs[in_msg.LineAddress];
+			Entry entry := getCacheEntry(in_msg.LineAddress);
+			State st := getState(tbe, entry, in_msg.LineAddress);
+			Addr LineAddress := in_msg.LineAddress;
+			if (st == State:I) {
+			}
+			else if (st == State:I_load) {
+				if (in_msg.Type == CoherenceMessageType:Inv) {
+					setState(tbe, entry, LineAddress, State:I_load_Inv_I);
+					reqfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:Inv_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:GetS_Ack) {
+					entry.clL1 := in_msg.cl;
+					setState(tbe, entry, LineAddress, State:S);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.readCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					reqfrom_in.dequeue(clockEdge());
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:I_load_Inv_I) {
+				if (in_msg.Type == CoherenceMessageType:GetS_Ack) {
+					entry.clL1 := in_msg.cl;
+					setState(tbe, entry, LineAddress, State:I);
+					assert(is_valid(entry));
+					trigger(Event:deallocreqfrom_in, LineAddress, entry, tbe);
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:I_store) {
+				if (in_msg.Type == CoherenceMessageType:Inv_Ack) {
+					entry.acksReceivedL1 := entry.acksReceivedL1+1;
+					setState(tbe, entry, LineAddress, State:I_store);
+					reqfrom_in.dequeue(clockEdge());
+				}
+				else if (in_msg.Type == CoherenceMessageType:GetM_Ack_AD) {
+					entry.acksExpectedL1 := in_msg.acksExpected;
+					entry.clL1 := in_msg.cl;
+					if (entry.acksExpectedL1 == entry.acksReceivedL1)  {
+						entry.acksReceivedL1 := 0;
+					entry.acksExpectedL1 := 0;
+					setState(tbe, entry, LineAddress, State:M);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.writeCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					reqfrom_in.dequeue(clockEdge());
+					}
+					else if(entry.acksExpectedL1 != entry.acksReceivedL1)  {
+					setState(tbe, entry, LineAddress, State:I_store_GetM_Ack_AD);
+					reqfrom_in.dequeue(clockEdge());
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:Fwd_GetM) {
+					setState(tbe, entry, LineAddress, State:I_store_Fwd_GetM_I);
+					reqfrom_in.dequeue(clockEdge());
+				}
+				else if (in_msg.Type == CoherenceMessageType:Fwd_GetS) {
+					setState(tbe, entry, LineAddress, State:I_store_Fwd_GetS_S);
+					reqfrom_in.dequeue(clockEdge());
+				}
+				else if (in_msg.Type == CoherenceMessageType:GetM_Ack_D) {
+					entry.clL1 := in_msg.cl;
+					setState(tbe, entry, LineAddress, State:M);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.writeCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					reqfrom_in.dequeue(clockEdge());
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:I_store_GetM_Ack_AD) {
+				if (in_msg.Type == CoherenceMessageType:Inv_Ack) {
+					entry.acksReceivedL1 := entry.acksReceivedL1+1;
+					if (entry.acksExpectedL1 == entry.acksReceivedL1)  {
+						entry.acksReceivedL1 := 0;
+					entry.acksExpectedL1 := 0;
+					setState(tbe, entry, LineAddress, State:M);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.writeCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					reqfrom_in.dequeue(clockEdge());
+					}
+					else if(entry.acksExpectedL1 != entry.acksReceivedL1)  {
+					setState(tbe, entry, LineAddress, State:I_store_GetM_Ack_AD);
+					reqfrom_in.dequeue(clockEdge());
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:Fwd_GetM) {
+					setState(tbe, entry, LineAddress, State:I_store_GetM_Ack_AD_Fwd_GetM_I);
+					reqfrom_in.dequeue(clockEdge());
+				}
+				else if (in_msg.Type == CoherenceMessageType:Fwd_GetS) {
+					setState(tbe, entry, LineAddress, State:I_store_GetM_Ack_AD_Fwd_GetS_S);
+					reqfrom_in.dequeue(clockEdge());
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:I_store_GetM_Ack_AD_Fwd_GetM_I) {
+				if (in_msg.Type == CoherenceMessageType:Inv_Ack) {
+					entry.acksReceivedL1 := entry.acksReceivedL1+1;
+					if (entry.acksExpectedL1 == entry.acksReceivedL1)  {
+						entry.acksReceivedL1 := 0;
+					entry.acksExpectedL1 := 0;
+					setState(tbe, entry, LineAddress, State:I_store_GetM_Ack_AD_Fwd_GetM_I);
+					reqfrom_in.dequeue(clockEdge());
+					}
+					else if(entry.acksExpectedL1 != entry.acksReceivedL1)  {
+					setState(tbe, entry, LineAddress, State:I);
+					assert(is_valid(entry));
+					trigger(Event:deallocreqfrom_in, LineAddress, entry, tbe);
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetM_Ack_D;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					}
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:I_store_GetM_Ack_AD_Fwd_GetS_S) {
+				if (in_msg.Type == CoherenceMessageType:Inv_Ack) {
+					entry.acksReceivedL1 := entry.acksReceivedL1+1;
+					if (entry.acksExpectedL1 == entry.acksReceivedL1)  {
+						entry.acksReceivedL1 := 0;
+					entry.acksExpectedL1 := 0;
+					setState(tbe, entry, LineAddress, State:S);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.writeCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					reqfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetS_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(mapAddressToMachine(LineAddress, MachineType:Directory));
+						out_msg.Type := CoherenceMessageType:WB;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					}
+					else if(entry.acksExpectedL1 != entry.acksReceivedL1)  {
+					setState(tbe, entry, LineAddress, State:I_store_GetM_Ack_AD_Fwd_GetS_S);
+					reqfrom_in.dequeue(clockEdge());
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:Inv) {
+					setState(tbe, entry, LineAddress, State:I_store_GetM_Ack_AD_Fwd_GetS_S_Inv_I);
+					reqfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:Inv_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:I_store_GetM_Ack_AD_Fwd_GetS_S_Inv_I) {
+				if (in_msg.Type == CoherenceMessageType:Inv_Ack) {
+					entry.acksReceivedL1 := entry.acksReceivedL1+1;
+					if (entry.acksExpectedL1 == entry.acksReceivedL1)  {
+						entry.acksReceivedL1 := 0;
+					entry.acksExpectedL1 := 0;
+					setState(tbe, entry, LineAddress, State:I_store_GetM_Ack_AD_Fwd_GetS_S_Inv_I);
+					reqfrom_in.dequeue(clockEdge());
+					}
+					else if(entry.acksExpectedL1 != entry.acksReceivedL1)  {
+					setState(tbe, entry, LineAddress, State:I);
+					assert(is_valid(entry));
+					trigger(Event:deallocreqfrom_in, LineAddress, entry, tbe);
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetS_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(mapAddressToMachine(LineAddress, MachineType:Directory));
+						out_msg.Type := CoherenceMessageType:WB;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					}
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:I_store_Fwd_GetM_I) {
+				if (in_msg.Type == CoherenceMessageType:GetM_Ack_AD) {
+					entry.acksExpectedL1 := in_msg.acksExpected;
+					entry.clL1 := in_msg.cl;
+					if (entry.acksExpectedL1 == entry.acksReceivedL1)  {
+						entry.acksReceivedL1 := 0;
+					entry.acksExpectedL1 := 0;
+					setState(tbe, entry, LineAddress, State:I_store_GetM_Ack_AD_Fwd_GetM_I);
+					reqfrom_in.dequeue(clockEdge());
+					}
+					else if(entry.acksExpectedL1 != entry.acksReceivedL1)  {
+					setState(tbe, entry, LineAddress, State:I);
+					assert(is_valid(entry));
+					trigger(Event:deallocreqfrom_in, LineAddress, entry, tbe);
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetM_Ack_D;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:GetM_Ack_D) {
+					entry.clL1 := in_msg.cl;
+					setState(tbe, entry, LineAddress, State:I);
+					assert(is_valid(entry));
+					trigger(Event:deallocreqfrom_in, LineAddress, entry, tbe);
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetM_Ack_D;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:Inv_Ack) {
+					entry.acksReceivedL1 := entry.acksReceivedL1+1;
+					setState(tbe, entry, LineAddress, State:I_store_Fwd_GetM_I);
+					reqfrom_in.dequeue(clockEdge());
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:I_store_Fwd_GetS_S) {
+				if (in_msg.Type == CoherenceMessageType:GetM_Ack_AD) {
+					entry.acksExpectedL1 := in_msg.acksExpected;
+					entry.clL1 := in_msg.cl;
+					if (entry.acksExpectedL1 == entry.acksReceivedL1)  {
+						entry.acksReceivedL1 := 0;
+					entry.acksExpectedL1 := 0;
+					setState(tbe, entry, LineAddress, State:S);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.writeCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					reqfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetS_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(mapAddressToMachine(LineAddress, MachineType:Directory));
+						out_msg.Type := CoherenceMessageType:WB;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					}
+					else if(entry.acksExpectedL1 != entry.acksReceivedL1)  {
+					setState(tbe, entry, LineAddress, State:I_store_GetM_Ack_AD_Fwd_GetS_S);
+					reqfrom_in.dequeue(clockEdge());
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:Inv_Ack) {
+					entry.acksReceivedL1 := entry.acksReceivedL1+1;
+					setState(tbe, entry, LineAddress, State:I_store_Fwd_GetS_S);
+					reqfrom_in.dequeue(clockEdge());
+				}
+				else if (in_msg.Type == CoherenceMessageType:Inv) {
+					setState(tbe, entry, LineAddress, State:I_store_Fwd_GetS_S_Inv_I);
+					reqfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:Inv_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:GetM_Ack_D) {
+					entry.clL1 := in_msg.cl;
+					setState(tbe, entry, LineAddress, State:S);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.writeCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					reqfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetS_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(mapAddressToMachine(LineAddress, MachineType:Directory));
+						out_msg.Type := CoherenceMessageType:WB;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:I_store_Fwd_GetS_S_Inv_I) {
+				if (in_msg.Type == CoherenceMessageType:GetM_Ack_AD) {
+					entry.acksExpectedL1 := in_msg.acksExpected;
+					entry.clL1 := in_msg.cl;
+					if (entry.acksExpectedL1 == entry.acksReceivedL1)  {
+						entry.acksReceivedL1 := 0;
+					entry.acksExpectedL1 := 0;
+					setState(tbe, entry, LineAddress, State:I_store_GetM_Ack_AD_Fwd_GetS_S_Inv_I);
+					reqfrom_in.dequeue(clockEdge());
+					}
+					else if(entry.acksExpectedL1 != entry.acksReceivedL1)  {
+					setState(tbe, entry, LineAddress, State:I);
+					assert(is_valid(entry));
+					trigger(Event:deallocreqfrom_in, LineAddress, entry, tbe);
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetS_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(mapAddressToMachine(LineAddress, MachineType:Directory));
+						out_msg.Type := CoherenceMessageType:WB;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:GetM_Ack_D) {
+					entry.clL1 := in_msg.cl;
+					setState(tbe, entry, LineAddress, State:I);
+					assert(is_valid(entry));
+					trigger(Event:deallocreqfrom_in, LineAddress, entry, tbe);
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetS_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(mapAddressToMachine(LineAddress, MachineType:Directory));
+						out_msg.Type := CoherenceMessageType:WB;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:Inv_Ack) {
+					entry.acksReceivedL1 := entry.acksReceivedL1+1;
+					setState(tbe, entry, LineAddress, State:I_store_Fwd_GetS_S_Inv_I);
+					reqfrom_in.dequeue(clockEdge());
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:M) {
+				if (in_msg.Type == CoherenceMessageType:Fwd_GetM) {
+					setState(tbe, entry, LineAddress, State:I);
+					assert(is_valid(entry));
+					trigger(Event:deallocreqfrom_in, LineAddress, entry, tbe);
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetM_Ack_D;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:Fwd_GetS) {
+					setState(tbe, entry, LineAddress, State:S);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.readCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					reqfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetS_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(mapAddressToMachine(LineAddress, MachineType:Directory));
+						out_msg.Type := CoherenceMessageType:WB;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:M_evict) {
+				if (in_msg.Type == CoherenceMessageType:Put_Ack) {
+					setState(tbe, entry, LineAddress, State:I);
+					assert(is_valid(entry));
+					trigger(Event:deallocreqfrom_in, LineAddress, entry, tbe);
+				}
+				else if (in_msg.Type == CoherenceMessageType:Fwd_GetM) {
+					setState(tbe, entry, LineAddress, State:M_evict_Fwd_GetM);
+					reqfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetM_Ack_D;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:Fwd_GetS) {
+					setState(tbe, entry, LineAddress, State:S_evict);
+					reqfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetS_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(mapAddressToMachine(LineAddress, MachineType:Directory));
+						out_msg.Type := CoherenceMessageType:WB;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:M_evict_Fwd_GetM) {
+				if (in_msg.Type == CoherenceMessageType:Put_Ack) {
+					setState(tbe, entry, LineAddress, State:I);
+					assert(is_valid(entry));
+					trigger(Event:deallocreqfrom_in, LineAddress, entry, tbe);
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:S) {
+				if (in_msg.Type == CoherenceMessageType:Inv) {
+					setState(tbe, entry, LineAddress, State:I);
+					assert(is_valid(entry));
+					trigger(Event:deallocreqfrom_in, LineAddress, entry, tbe);
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:Inv_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:S_evict) {
+				if (in_msg.Type == CoherenceMessageType:Put_Ack) {
+					setState(tbe, entry, LineAddress, State:I);
+					assert(is_valid(entry));
+					trigger(Event:deallocreqfrom_in, LineAddress, entry, tbe);
+				}
+				else if (in_msg.Type == CoherenceMessageType:Inv) {
+					setState(tbe, entry, LineAddress, State:M_evict_Fwd_GetM);
+					reqfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:Inv_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:S_store) {
+				if (in_msg.Type == CoherenceMessageType:Inv) {
+					setState(tbe, entry, LineAddress, State:I_store);
+					reqfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:Inv_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:Fwd_GetM) {
+					setState(tbe, entry, LineAddress, State:I_store_Fwd_GetM_I);
+					reqfrom_in.dequeue(clockEdge());
+				}
+				else if (in_msg.Type == CoherenceMessageType:GetM_Ack_AD) {
+					entry.acksExpectedL1 := in_msg.acksExpected;
+					entry.clL1 := in_msg.cl;
+					if (entry.acksExpectedL1 == entry.acksReceivedL1)  {
+						entry.acksReceivedL1 := 0;
+					entry.acksExpectedL1 := 0;
+					setState(tbe, entry, LineAddress, State:S_store_GetM_Ack_AD);
+					reqfrom_in.dequeue(clockEdge());
+					}
+					else if(entry.acksExpectedL1 != entry.acksReceivedL1)  {
+					setState(tbe, entry, LineAddress, State:M);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.writeCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					reqfrom_in.dequeue(clockEdge());
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:GetM_Ack_D) {
+					setState(tbe, entry, LineAddress, State:M);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.writeCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					reqfrom_in.dequeue(clockEdge());
+				}
+				else if (in_msg.Type == CoherenceMessageType:Inv_Ack) {
+					entry.acksReceivedL1 := entry.acksReceivedL1+1;
+					setState(tbe, entry, LineAddress, State:S_store);
+					reqfrom_in.dequeue(clockEdge());
+				}
+				else if (in_msg.Type == CoherenceMessageType:Fwd_GetS) {
+					setState(tbe, entry, LineAddress, State:S_store_Fwd_GetS_S);
+					reqfrom_in.dequeue(clockEdge());
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:S_store_GetM_Ack_AD) {
+				if (in_msg.Type == CoherenceMessageType:Fwd_GetM) {
+					setState(tbe, entry, LineAddress, State:I_store_GetM_Ack_AD_Fwd_GetM_I);
+					reqfrom_in.dequeue(clockEdge());
+				}
+				else if (in_msg.Type == CoherenceMessageType:Inv_Ack) {
+					entry.acksReceivedL1 := entry.acksReceivedL1+1;
+					if (entry.acksExpectedL1 == entry.acksReceivedL1)  {
+						entry.acksReceivedL1 := 0;
+					entry.acksExpectedL1 := 0;
+					setState(tbe, entry, LineAddress, State:S_store_GetM_Ack_AD);
+					reqfrom_in.dequeue(clockEdge());
+					}
+					else if(entry.acksExpectedL1 != entry.acksReceivedL1)  {
+					setState(tbe, entry, LineAddress, State:M);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.writeCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					reqfrom_in.dequeue(clockEdge());
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:Fwd_GetS) {
+					setState(tbe, entry, LineAddress, State:S_store_GetM_Ack_AD_Fwd_GetS_S);
+					reqfrom_in.dequeue(clockEdge());
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:S_store_GetM_Ack_AD_Fwd_GetS_S) {
+				if (in_msg.Type == CoherenceMessageType:Inv) {
+					setState(tbe, entry, LineAddress, State:I_store_GetM_Ack_AD_Fwd_GetS_S_Inv_I);
+					reqfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:Inv_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:Inv_Ack) {
+					entry.acksReceivedL1 := entry.acksReceivedL1+1;
+					if (entry.acksExpectedL1 == entry.acksReceivedL1)  {
+						entry.acksReceivedL1 := 0;
+					entry.acksExpectedL1 := 0;
+					setState(tbe, entry, LineAddress, State:S_store_GetM_Ack_AD_Fwd_GetS_S);
+					reqfrom_in.dequeue(clockEdge());
+					}
+					else if(entry.acksExpectedL1 != entry.acksReceivedL1)  {
+					setState(tbe, entry, LineAddress, State:S);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.writeCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					reqfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetS_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(mapAddressToMachine(LineAddress, MachineType:Directory));
+						out_msg.Type := CoherenceMessageType:WB;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					}
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:S_store_Fwd_GetS_S) {
+				if (in_msg.Type == CoherenceMessageType:Inv) {
+					setState(tbe, entry, LineAddress, State:I_store_Fwd_GetS_S_Inv_I);
+					reqfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:Inv_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:GetM_Ack_AD) {
+					entry.acksExpectedL1 := in_msg.acksExpected;
+					entry.clL1 := in_msg.cl;
+					if (entry.acksExpectedL1 == entry.acksReceivedL1)  {
+						entry.acksReceivedL1 := 0;
+					entry.acksExpectedL1 := 0;
+					setState(tbe, entry, LineAddress, State:S_store_GetM_Ack_AD_Fwd_GetS_S);
+					reqfrom_in.dequeue(clockEdge());
+					}
+					else if(entry.acksExpectedL1 != entry.acksReceivedL1)  {
+					setState(tbe, entry, LineAddress, State:S);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.writeCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					reqfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetS_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(mapAddressToMachine(LineAddress, MachineType:Directory));
+						out_msg.Type := CoherenceMessageType:WB;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:GetM_Ack_D) {
+					setState(tbe, entry, LineAddress, State:S);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.writeCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					reqfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetS_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(mapAddressToMachine(LineAddress, MachineType:Directory));
+						out_msg.Type := CoherenceMessageType:WB;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:Inv_Ack) {
+					entry.acksReceivedL1 := entry.acksReceivedL1+1;
+					setState(tbe, entry, LineAddress, State:S_store_Fwd_GetS_S);
+					reqfrom_in.dequeue(clockEdge());
+				}
+				else {
+					//stall
+				}
+			}
+			else {
+				error("Unrecognized state in in_port=respfrom_in!");
+			}
+		}
+	}
+}
+
+
+in_port(respfrom_in, CoherenceMessage, fwdFrom) {
+	if (respfrom_in.isReady(clockEdge())) {
+		peek (respfrom_in, CoherenceMessage) {
+			TBE tbe := TBEs[in_msg.LineAddress];
+			Entry entry := getCacheEntry(in_msg.LineAddress);
+			State st := getState(tbe, entry, in_msg.LineAddress);
+			Addr LineAddress := in_msg.LineAddress;
+			if (st == State:I) {
+			}
+			else if (st == State:I_load) {
+				if (in_msg.Type == CoherenceMessageType:Inv) {
+					setState(tbe, entry, LineAddress, State:I_load_Inv_I);
+					respfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:Inv_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:GetS_Ack) {
+					entry.clL1 := in_msg.cl;
+					setState(tbe, entry, LineAddress, State:S);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.readCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					respfrom_in.dequeue(clockEdge());
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:I_load_Inv_I) {
+				if (in_msg.Type == CoherenceMessageType:GetS_Ack) {
+					entry.clL1 := in_msg.cl;
+					setState(tbe, entry, LineAddress, State:I);
+					assert(is_valid(entry));
+					trigger(Event:deallocrespfrom_in, LineAddress, entry, tbe);
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:I_store) {
+				if (in_msg.Type == CoherenceMessageType:Inv_Ack) {
+					entry.acksReceivedL1 := entry.acksReceivedL1+1;
+					setState(tbe, entry, LineAddress, State:I_store);
+					respfrom_in.dequeue(clockEdge());
+				}
+				else if (in_msg.Type == CoherenceMessageType:GetM_Ack_AD) {
+					entry.acksExpectedL1 := in_msg.acksExpected;
+					entry.clL1 := in_msg.cl;
+					if (entry.acksExpectedL1 == entry.acksReceivedL1)  {
+						entry.acksReceivedL1 := 0;
+					entry.acksExpectedL1 := 0;
+					setState(tbe, entry, LineAddress, State:M);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.writeCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					respfrom_in.dequeue(clockEdge());
+					}
+					else if(entry.acksExpectedL1 != entry.acksReceivedL1)  {
+					setState(tbe, entry, LineAddress, State:I_store_GetM_Ack_AD);
+					respfrom_in.dequeue(clockEdge());
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:Fwd_GetM) {
+					setState(tbe, entry, LineAddress, State:I_store_Fwd_GetM_I);
+					respfrom_in.dequeue(clockEdge());
+				}
+				else if (in_msg.Type == CoherenceMessageType:Fwd_GetS) {
+					setState(tbe, entry, LineAddress, State:I_store_Fwd_GetS_S);
+					respfrom_in.dequeue(clockEdge());
+				}
+				else if (in_msg.Type == CoherenceMessageType:GetM_Ack_D) {
+					entry.clL1 := in_msg.cl;
+					setState(tbe, entry, LineAddress, State:M);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.writeCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					respfrom_in.dequeue(clockEdge());
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:I_store_GetM_Ack_AD) {
+				if (in_msg.Type == CoherenceMessageType:Inv_Ack) {
+					entry.acksReceivedL1 := entry.acksReceivedL1+1;
+					if (entry.acksExpectedL1 == entry.acksReceivedL1)  {
+						entry.acksReceivedL1 := 0;
+					entry.acksExpectedL1 := 0;
+					setState(tbe, entry, LineAddress, State:M);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.writeCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					respfrom_in.dequeue(clockEdge());
+					}
+					else if(entry.acksExpectedL1 != entry.acksReceivedL1)  {
+					setState(tbe, entry, LineAddress, State:I_store_GetM_Ack_AD);
+					respfrom_in.dequeue(clockEdge());
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:Fwd_GetM) {
+					setState(tbe, entry, LineAddress, State:I_store_GetM_Ack_AD_Fwd_GetM_I);
+					respfrom_in.dequeue(clockEdge());
+				}
+				else if (in_msg.Type == CoherenceMessageType:Fwd_GetS) {
+					setState(tbe, entry, LineAddress, State:I_store_GetM_Ack_AD_Fwd_GetS_S);
+					respfrom_in.dequeue(clockEdge());
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:I_store_GetM_Ack_AD_Fwd_GetM_I) {
+				if (in_msg.Type == CoherenceMessageType:Inv_Ack) {
+					entry.acksReceivedL1 := entry.acksReceivedL1+1;
+					if (entry.acksExpectedL1 == entry.acksReceivedL1)  {
+						entry.acksReceivedL1 := 0;
+					entry.acksExpectedL1 := 0;
+					setState(tbe, entry, LineAddress, State:I_store_GetM_Ack_AD_Fwd_GetM_I);
+					respfrom_in.dequeue(clockEdge());
+					}
+					else if(entry.acksExpectedL1 != entry.acksReceivedL1)  {
+					setState(tbe, entry, LineAddress, State:I);
+					assert(is_valid(entry));
+					trigger(Event:deallocrespfrom_in, LineAddress, entry, tbe);
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetM_Ack_D;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					}
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:I_store_GetM_Ack_AD_Fwd_GetS_S) {
+				if (in_msg.Type == CoherenceMessageType:Inv_Ack) {
+					entry.acksReceivedL1 := entry.acksReceivedL1+1;
+					if (entry.acksExpectedL1 == entry.acksReceivedL1)  {
+						entry.acksReceivedL1 := 0;
+					entry.acksExpectedL1 := 0;
+					setState(tbe, entry, LineAddress, State:S);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.writeCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					respfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetS_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(mapAddressToMachine(LineAddress, MachineType:Directory));
+						out_msg.Type := CoherenceMessageType:WB;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					}
+					else if(entry.acksExpectedL1 != entry.acksReceivedL1)  {
+					setState(tbe, entry, LineAddress, State:I_store_GetM_Ack_AD_Fwd_GetS_S);
+					respfrom_in.dequeue(clockEdge());
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:Inv) {
+					setState(tbe, entry, LineAddress, State:I_store_GetM_Ack_AD_Fwd_GetS_S_Inv_I);
+					respfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:Inv_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:I_store_GetM_Ack_AD_Fwd_GetS_S_Inv_I) {
+				if (in_msg.Type == CoherenceMessageType:Inv_Ack) {
+					entry.acksReceivedL1 := entry.acksReceivedL1+1;
+					if (entry.acksExpectedL1 == entry.acksReceivedL1)  {
+						entry.acksReceivedL1 := 0;
+					entry.acksExpectedL1 := 0;
+					setState(tbe, entry, LineAddress, State:I_store_GetM_Ack_AD_Fwd_GetS_S_Inv_I);
+					respfrom_in.dequeue(clockEdge());
+					}
+					else if(entry.acksExpectedL1 != entry.acksReceivedL1)  {
+					setState(tbe, entry, LineAddress, State:I);
+					assert(is_valid(entry));
+					trigger(Event:deallocrespfrom_in, LineAddress, entry, tbe);
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetS_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(mapAddressToMachine(LineAddress, MachineType:Directory));
+						out_msg.Type := CoherenceMessageType:WB;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					}
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:I_store_Fwd_GetM_I) {
+				if (in_msg.Type == CoherenceMessageType:GetM_Ack_AD) {
+					entry.acksExpectedL1 := in_msg.acksExpected;
+					entry.clL1 := in_msg.cl;
+					if (entry.acksExpectedL1 == entry.acksReceivedL1)  {
+						entry.acksReceivedL1 := 0;
+					entry.acksExpectedL1 := 0;
+					setState(tbe, entry, LineAddress, State:I_store_GetM_Ack_AD_Fwd_GetM_I);
+					respfrom_in.dequeue(clockEdge());
+					}
+					else if(entry.acksExpectedL1 != entry.acksReceivedL1)  {
+					setState(tbe, entry, LineAddress, State:I);
+					assert(is_valid(entry));
+					trigger(Event:deallocrespfrom_in, LineAddress, entry, tbe);
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetM_Ack_D;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:GetM_Ack_D) {
+					entry.clL1 := in_msg.cl;
+					setState(tbe, entry, LineAddress, State:I);
+					assert(is_valid(entry));
+					trigger(Event:deallocrespfrom_in, LineAddress, entry, tbe);
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetM_Ack_D;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:Inv_Ack) {
+					entry.acksReceivedL1 := entry.acksReceivedL1+1;
+					setState(tbe, entry, LineAddress, State:I_store_Fwd_GetM_I);
+					respfrom_in.dequeue(clockEdge());
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:I_store_Fwd_GetS_S) {
+				if (in_msg.Type == CoherenceMessageType:GetM_Ack_AD) {
+					entry.acksExpectedL1 := in_msg.acksExpected;
+					entry.clL1 := in_msg.cl;
+					if (entry.acksExpectedL1 == entry.acksReceivedL1)  {
+						entry.acksReceivedL1 := 0;
+					entry.acksExpectedL1 := 0;
+					setState(tbe, entry, LineAddress, State:S);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.writeCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					respfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetS_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(mapAddressToMachine(LineAddress, MachineType:Directory));
+						out_msg.Type := CoherenceMessageType:WB;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					}
+					else if(entry.acksExpectedL1 != entry.acksReceivedL1)  {
+					setState(tbe, entry, LineAddress, State:I_store_GetM_Ack_AD_Fwd_GetS_S);
+					respfrom_in.dequeue(clockEdge());
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:Inv_Ack) {
+					entry.acksReceivedL1 := entry.acksReceivedL1+1;
+					setState(tbe, entry, LineAddress, State:I_store_Fwd_GetS_S);
+					respfrom_in.dequeue(clockEdge());
+				}
+				else if (in_msg.Type == CoherenceMessageType:Inv) {
+					setState(tbe, entry, LineAddress, State:I_store_Fwd_GetS_S_Inv_I);
+					respfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:Inv_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:GetM_Ack_D) {
+					entry.clL1 := in_msg.cl;
+					setState(tbe, entry, LineAddress, State:S);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.writeCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					respfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetS_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(mapAddressToMachine(LineAddress, MachineType:Directory));
+						out_msg.Type := CoherenceMessageType:WB;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:I_store_Fwd_GetS_S_Inv_I) {
+				if (in_msg.Type == CoherenceMessageType:GetM_Ack_AD) {
+					entry.acksExpectedL1 := in_msg.acksExpected;
+					entry.clL1 := in_msg.cl;
+					if (entry.acksExpectedL1 == entry.acksReceivedL1)  {
+						entry.acksReceivedL1 := 0;
+					entry.acksExpectedL1 := 0;
+					setState(tbe, entry, LineAddress, State:I_store_GetM_Ack_AD_Fwd_GetS_S_Inv_I);
+					respfrom_in.dequeue(clockEdge());
+					}
+					else if(entry.acksExpectedL1 != entry.acksReceivedL1)  {
+					setState(tbe, entry, LineAddress, State:I);
+					assert(is_valid(entry));
+					trigger(Event:deallocrespfrom_in, LineAddress, entry, tbe);
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetS_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(mapAddressToMachine(LineAddress, MachineType:Directory));
+						out_msg.Type := CoherenceMessageType:WB;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:GetM_Ack_D) {
+					entry.clL1 := in_msg.cl;
+					setState(tbe, entry, LineAddress, State:I);
+					assert(is_valid(entry));
+					trigger(Event:deallocrespfrom_in, LineAddress, entry, tbe);
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetS_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(mapAddressToMachine(LineAddress, MachineType:Directory));
+						out_msg.Type := CoherenceMessageType:WB;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:Inv_Ack) {
+					entry.acksReceivedL1 := entry.acksReceivedL1+1;
+					setState(tbe, entry, LineAddress, State:I_store_Fwd_GetS_S_Inv_I);
+					respfrom_in.dequeue(clockEdge());
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:M) {
+				if (in_msg.Type == CoherenceMessageType:Fwd_GetM) {
+					setState(tbe, entry, LineAddress, State:I);
+					assert(is_valid(entry));
+					trigger(Event:deallocrespfrom_in, LineAddress, entry, tbe);
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetM_Ack_D;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:Fwd_GetS) {
+					setState(tbe, entry, LineAddress, State:S);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.readCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					respfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetS_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(mapAddressToMachine(LineAddress, MachineType:Directory));
+						out_msg.Type := CoherenceMessageType:WB;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:M_evict) {
+				if (in_msg.Type == CoherenceMessageType:Put_Ack) {
+					setState(tbe, entry, LineAddress, State:I);
+					assert(is_valid(entry));
+					trigger(Event:deallocrespfrom_in, LineAddress, entry, tbe);
+				}
+				else if (in_msg.Type == CoherenceMessageType:Fwd_GetM) {
+					setState(tbe, entry, LineAddress, State:M_evict_Fwd_GetM);
+					respfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetM_Ack_D;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:Fwd_GetS) {
+					setState(tbe, entry, LineAddress, State:S_evict);
+					respfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetS_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(mapAddressToMachine(LineAddress, MachineType:Directory));
+						out_msg.Type := CoherenceMessageType:WB;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:M_evict_Fwd_GetM) {
+				if (in_msg.Type == CoherenceMessageType:Put_Ack) {
+					setState(tbe, entry, LineAddress, State:I);
+					assert(is_valid(entry));
+					trigger(Event:deallocrespfrom_in, LineAddress, entry, tbe);
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:S) {
+				if (in_msg.Type == CoherenceMessageType:Inv) {
+					setState(tbe, entry, LineAddress, State:I);
+					assert(is_valid(entry));
+					trigger(Event:deallocrespfrom_in, LineAddress, entry, tbe);
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:Inv_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:S_evict) {
+				if (in_msg.Type == CoherenceMessageType:Put_Ack) {
+					setState(tbe, entry, LineAddress, State:I);
+					assert(is_valid(entry));
+					trigger(Event:deallocrespfrom_in, LineAddress, entry, tbe);
+				}
+				else if (in_msg.Type == CoherenceMessageType:Inv) {
+					setState(tbe, entry, LineAddress, State:M_evict_Fwd_GetM);
+					respfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:Inv_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:S_store) {
+				if (in_msg.Type == CoherenceMessageType:Inv) {
+					setState(tbe, entry, LineAddress, State:I_store);
+					respfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:Inv_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:Fwd_GetM) {
+					setState(tbe, entry, LineAddress, State:I_store_Fwd_GetM_I);
+					respfrom_in.dequeue(clockEdge());
+				}
+				else if (in_msg.Type == CoherenceMessageType:GetM_Ack_AD) {
+					entry.acksExpectedL1 := in_msg.acksExpected;
+					entry.clL1 := in_msg.cl;
+					if (entry.acksExpectedL1 == entry.acksReceivedL1)  {
+						entry.acksReceivedL1 := 0;
+					entry.acksExpectedL1 := 0;
+					setState(tbe, entry, LineAddress, State:S_store_GetM_Ack_AD);
+					respfrom_in.dequeue(clockEdge());
+					}
+					else if(entry.acksExpectedL1 != entry.acksReceivedL1)  {
+					setState(tbe, entry, LineAddress, State:M);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.writeCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					respfrom_in.dequeue(clockEdge());
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:GetM_Ack_D) {
+					setState(tbe, entry, LineAddress, State:M);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.writeCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					respfrom_in.dequeue(clockEdge());
+				}
+				else if (in_msg.Type == CoherenceMessageType:Inv_Ack) {
+					entry.acksReceivedL1 := entry.acksReceivedL1+1;
+					setState(tbe, entry, LineAddress, State:S_store);
+					respfrom_in.dequeue(clockEdge());
+				}
+				else if (in_msg.Type == CoherenceMessageType:Fwd_GetS) {
+					setState(tbe, entry, LineAddress, State:S_store_Fwd_GetS_S);
+					respfrom_in.dequeue(clockEdge());
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:S_store_GetM_Ack_AD) {
+				if (in_msg.Type == CoherenceMessageType:Fwd_GetM) {
+					setState(tbe, entry, LineAddress, State:I_store_GetM_Ack_AD_Fwd_GetM_I);
+					respfrom_in.dequeue(clockEdge());
+				}
+				else if (in_msg.Type == CoherenceMessageType:Inv_Ack) {
+					entry.acksReceivedL1 := entry.acksReceivedL1+1;
+					if (entry.acksExpectedL1 == entry.acksReceivedL1)  {
+						entry.acksReceivedL1 := 0;
+					entry.acksExpectedL1 := 0;
+					setState(tbe, entry, LineAddress, State:S_store_GetM_Ack_AD);
+					respfrom_in.dequeue(clockEdge());
+					}
+					else if(entry.acksExpectedL1 != entry.acksReceivedL1)  {
+					setState(tbe, entry, LineAddress, State:M);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.writeCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					respfrom_in.dequeue(clockEdge());
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:Fwd_GetS) {
+					setState(tbe, entry, LineAddress, State:S_store_GetM_Ack_AD_Fwd_GetS_S);
+					respfrom_in.dequeue(clockEdge());
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:S_store_GetM_Ack_AD_Fwd_GetS_S) {
+				if (in_msg.Type == CoherenceMessageType:Inv) {
+					setState(tbe, entry, LineAddress, State:I_store_GetM_Ack_AD_Fwd_GetS_S_Inv_I);
+					respfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:Inv_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:Inv_Ack) {
+					entry.acksReceivedL1 := entry.acksReceivedL1+1;
+					if (entry.acksExpectedL1 == entry.acksReceivedL1)  {
+						entry.acksReceivedL1 := 0;
+					entry.acksExpectedL1 := 0;
+					setState(tbe, entry, LineAddress, State:S_store_GetM_Ack_AD_Fwd_GetS_S);
+					respfrom_in.dequeue(clockEdge());
+					}
+					else if(entry.acksExpectedL1 != entry.acksReceivedL1)  {
+					setState(tbe, entry, LineAddress, State:S);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.writeCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					respfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetS_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(mapAddressToMachine(LineAddress, MachineType:Directory));
+						out_msg.Type := CoherenceMessageType:WB;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					}
+				}
+				else {
+					//stall
+				}
+			}
+			else if (st == State:S_store_Fwd_GetS_S) {
+				if (in_msg.Type == CoherenceMessageType:Inv) {
+					setState(tbe, entry, LineAddress, State:I_store_Fwd_GetS_S_Inv_I);
+					respfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:Inv_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:GetM_Ack_AD) {
+					entry.acksExpectedL1 := in_msg.acksExpected;
+					entry.clL1 := in_msg.cl;
+					if (entry.acksExpectedL1 == entry.acksReceivedL1)  {
+						entry.acksReceivedL1 := 0;
+					entry.acksExpectedL1 := 0;
+					setState(tbe, entry, LineAddress, State:S_store_GetM_Ack_AD_Fwd_GetS_S);
+					respfrom_in.dequeue(clockEdge());
+					}
+					else if(entry.acksExpectedL1 != entry.acksReceivedL1)  {
+					setState(tbe, entry, LineAddress, State:S);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.writeCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					respfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetS_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(mapAddressToMachine(LineAddress, MachineType:Directory));
+						out_msg.Type := CoherenceMessageType:WB;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:GetM_Ack_D) {
+					setState(tbe, entry, LineAddress, State:S);
+					assert(is_valid(entry));
+					cache.setMRU(entry);
+					sequencer.writeCallback(LineAddress, entry.clL1, true, machineIDToMachineType(in_msg.Sender));
+					respfrom_in.dequeue(clockEdge());
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(in_msg.Sender);
+						out_msg.Type := CoherenceMessageType:GetS_Ack;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+					enqueue(respto_out, CoherenceMessage, responseLatency) {
+						out_msg.LineAddress := LineAddress;
+						out_msg.MessageSize := MessageSizeType:Data;
+						out_msg.Destination.add(mapAddressToMachine(LineAddress, MachineType:Directory));
+						out_msg.Type := CoherenceMessageType:WB;
+						out_msg.Sender := machineID;
+						out_msg.cl := entry.clL1;
+					}
+				}
+				else if (in_msg.Type == CoherenceMessageType:Inv_Ack) {
+					entry.acksReceivedL1 := entry.acksReceivedL1+1;
+					setState(tbe, entry, LineAddress, State:S_store_Fwd_GetS_S);
+					respfrom_in.dequeue(clockEdge());
+				}
+				else {
+					//stall
+				}
+			}
+			else {
+				error("Unrecognized state in in_port=respfrom_in!");
+			}
+		}
+	}
+}
+
+
+in_port(mandatory_in, RubyRequest, mandatoryQueue) {
+        if (mandatory_in.isReady(clockEdge())) {
+            peek(mandatory_in, RubyRequest, block_on="LineAddress") {
+                Entry entry := getCacheEntry(in_msg.LineAddress);
+                TBE tbe := TBEs[in_msg.LineAddress];
+        
+                if (is_invalid(entry) && cacheMemory.cacheAvail(in_msg.LineAddress) == false ) {
+                    Addr LineAddress := cacheMemory.cacheProbe(in_msg.LineAddress);
+                    Entry entry := getCacheEntry(LineAddress);
+                    TBE tbe := TBEs[LineAddress];
+                    State st := getState(tbe, entry, LineAddress);
+                    if (st == State:M) {
+                        enqueue(reqto_out, CoherenceMessage, 1) {
+                            out_msg.LineAddress := LineAddress;
+                            out_msg.MessageSize := MessageSizeType:Data;
+                            out_msg.Destination.add(mapAddressToMachine(LineAddress, MachineType:Directory));
+                            out_msg.Type := CoherenceMessageType:PutM;
+                            out_msg.Sender := machineID;
+                            out_msg.cl := entry.clL1;
+                        }
+						DPRINTF(RubySlicc, "Switch %#x %s: evict -> M_evict\n", LineAddress, st);
+                        setState(tbe, entry, LineAddress, State:M_evict);
+                        if (send_evictions) {
+                            sequencer.evictionCallback(LineAddress);
+                        }
+                    } else if (st == State:S) {
+                        enqueue(reqto_out, CoherenceMessage, 1) {
+                            out_msg.LineAddress := LineAddress;
+                            out_msg.MessageSize := MessageSizeType:Data;
+                            out_msg.Destination.add(mapAddressToMachine(LineAddress, MachineType:Directory));
+                            out_msg.Type := CoherenceMessageType:PutS;
+                            out_msg.Sender := machineID;
+                        }
+						DPRINTF(RubySlicc, "Switch %#x %s: evict -> S_evict\n", LineAddress, st);
+                        setState(tbe, entry, LineAddress, State:S_evict);
+                        if (send_evictions) {
+                            sequencer.evictionCallback(LineAddress);
+                        }
+                    } else {
+                        // stall
+                    }
+                } else {
+                    State st := getState(tbe, entry, in_msg.LineAddress);
+                    Addr LineAddress := in_msg.LineAddress;
+                    if (in_msg.Type == RubyRequestType:LD || in_msg.Type == RubyRequestType:IFETCH) {
+                        if (st == State:I) {
+							DPRINTF(RubySlicc, "Switch %#x %s: %s -> I_load\n", LineAddress, st, in_msg.Type);
+                            trigger(Event:allocI_load, LineAddress, entry, tbe);
+                        } else if (st == State:M) {
+							DPRINTF(RubySlicc, "Switch %#x %s: %s -> M\n", LineAddress, st, in_msg.Type);
+                            trigger(Event:MloadMEvent, LineAddress, entry, tbe);
+                        } else if (st == State:S) {
+							DPRINTF(RubySlicc, "Switch %#x %s: %s -> S\n", LineAddress, st, in_msg.Type);
+                            trigger(Event:SloadSEvent, LineAddress, entry, tbe);
+                        } else {
+                            // stall
+                        }
+                    } else if (in_msg.Type == RubyRequestType:ST) {
+                        if (st == State:I) {
+							DPRINTF(RubySlicc, "Switch %#x %s: %s -> I_store\n", LineAddress, st, in_msg.Type);
+                            trigger(Event:allocI_store, LineAddress, entry, tbe);
+                        } else if (st == State:M) {
+							DPRINTF(RubySlicc, "Switch %#x %s: %s -> M\n", LineAddress, st, in_msg.Type);
+                            trigger(Event:MstoreMEvent, LineAddress, entry, tbe);
+                        } else if (st == State:S) {
+                            enqueue(reqto_out, CoherenceMessage, 1) {
+                                out_msg.LineAddress := LineAddress;
+                                out_msg.MessageSize := MessageSizeType:Data;
+                                out_msg.Destination.add(mapAddressToMachine(LineAddress, MachineType:Directory));
+                                out_msg.Type := CoherenceMessageType:Upgrade;
+                                out_msg.Sender := machineID;
+                            }
+                            entry.acksReceivedL1 := 0;
+							DPRINTF(RubySlicc, "Switch %#x %s: %s -> S_store\n", LineAddress, st, in_msg.Type);
+                            setState(tbe, entry, LineAddress, State:S_store);
+                            mandatory_in.dequeue(clockEdge());
+                        } else {
+                            // stall
+                        }
+                    } else {
+                        error("Unexpected message type from processor");
+                    }
+                }
+            }
+        }
+    }
+
+    action(deallocEntry, "d", desc="Deallocate an entry") {
+	  APPEND_TRANSITION_COMMENT("deallocEntry");
+	  DPRINTF(RubySlicc, "deallocEntry: %#x\n", address);
+      assert(is_valid(cache_entry));
+      cacheMemory.deallocate(address);
+      unset_cache_entry();
+    }
+
+    action(allocEntry, "a", desc="Allocate an entry") {
+		APPEND_TRANSITION_COMMENT("allocEntry");
+		DPRINTF(RubySlicc, "allocEntry\n");
+        assert(is_invalid(cache_entry));
+        assert(cacheMemory.cacheAvail(address));
+        set_cache_entry(cacheMemory.allocate(address, new Entry));
+    }
+
+    action(loadHit, "Lh", desc="Callback local load hit.") {
+		APPEND_TRANSITION_COMMENT("loadHit");
+		DPRINTF(RubySlicc, "loadHit: %#x\n", address);
+        assert(is_valid(cache_entry));
+        cacheMemory.setMRU(cache_entry);
+        sequencer.readCallback(address, cache_entry.clL1, false);
+    }
+  
+    action(storeHit, "Sh", desc="Callback local store hit.") {
+		APPEND_TRANSITION_COMMENT("storeHit");
+		DPRINTF(RubySlicc, "storeHit: %#x\n", address);
+        assert(is_valid(cache_entry));
+        cacheMemory.setMRU(cache_entry);
+        sequencer.writeCallback(address, cache_entry.clL1, false);
+    }
+    
+    action(popmandatory_in, "pmandatory_in0", desc="Pop the mandatory_in queue.") {
+		APPEND_TRANSITION_COMMENT("popmandatory_in");
+		DPRINTF(RubySlicc, "popmandatory_in\n");
+        mandatory_in.dequeue(clockEdge());
+	DPRINTF(RubySlicc, "popmandatory_in  finish\n");
+    }
+
+    action(popfwdfrom_in, "pfwdfrom_in0", desc="Pop the fwdfrom_in queue.") {
+		APPEND_TRANSITION_COMMENT("popfwdfrom_in");
+		DPRINTF(RubySlicc, "popfwdfrom_in\n");
+        fwdfrom_in.dequeue(clockEdge());
+    }
+
+    action(popreqfrom_in, "preqfrom_in0", desc="Pop the reqfrom_in queue.") {
+		APPEND_TRANSITION_COMMENT("popreqfrom_in");
+		DPRINTF(RubySlicc, "popreqfrom_in\n");
+        reqfrom_in.dequeue(clockEdge());
+    }
+
+    action(poprespfrom_in, "prespfrom_in0", desc="Pop the respfrom_in queue.") {
+		APPEND_TRANSITION_COMMENT("poprespfrom_in");
+		DPRINTF(RubySlicc, "poprespfrom_in\n");
+        respfrom_in.dequeue(clockEdge());
+    }
+
+    action(actionI_I_load, "II0", desc="TODO") {
+		APPEND_TRANSITION_COMMENT("actionI_I_load");
+		DPRINTF(RubySlicc, "actionI_I_load\n");
+        peek(mandatory_in, RubyRequest) {
+            //Entry entry := cache_entry;
+            Addr LineAddress := in_msg.LineAddress;
+            enqueue(reqto_out, CoherenceMessage, 1) {
+                out_msg.LineAddress := LineAddress;
+                out_msg.MessageSize := MessageSizeType:Data;
+                out_msg.Destination.add(mapAddressToMachine(LineAddress, MachineType:Directory));
+                out_msg.Type := CoherenceMessageType:GetS;
+                out_msg.Sender := machineID;
+                //out_msg.cl := entry.clL1;
+                ////out_msg.acksExpected := 0;
+            }
+        }
+    }
+
+    action(actionI_I_store, "II1", desc="TODO") {
+		APPEND_TRANSITION_COMMENT("actionI_I_store");
+		DPRINTF(RubySlicc, "actionI_I_store\n");
+        peek(mandatory_in, RubyRequest) {
+            Entry entry := cache_entry;
+            Addr LineAddress := in_msg.LineAddress;
+            enqueue(reqto_out, CoherenceMessage, 1) {
+                out_msg.LineAddress := LineAddress;
+                out_msg.MessageSize := MessageSizeType:Data;
+                out_msg.Destination.add(mapAddressToMachine(LineAddress, MachineType:Directory));
+                out_msg.Type := CoherenceMessageType:GetM;
+                out_msg.Sender := machineID;
+                //out_msg.cl := entry.clL1;
+                ////out_msg.acksExpected := 0;
+            }
+            entry.acksReceivedL1 := 0;
+        }
+    }
+
+    transition({I}, deallocfwdfrom_in) {
+	    deallocEntry;
+		popfwdfrom_in;
+	}
+
+	transition({I}, deallocreqfrom_in) {
+		deallocEntry;
+		popreqfrom_in;
+	}
+    
+	transition({I}, deallocrespfrom_in) {
+		deallocEntry;
+		poprespfrom_in;
+	}
+
+	transition(I, allocI_store, I_store) {
+		allocEntry;
+		actionI_I_store;
+		popmandatory_in;
+	}
+
+	transition(I, allocI_load, I_load) {
+		allocEntry;
+		actionI_I_load;
+		popmandatory_in;
+	}
+
+	transition(S, SloadSEvent, S) {
+		loadHit;
+		popmandatory_in;
+	}
+
+	transition(M, MloadMEvent, M) {
+		loadHit;
+		popmandatory_in;
+	}
+
+	transition(M, MstoreMEvent, M) {
+		storeHit;
+		popmandatory_in;
+	}
+}
